@@ -1,0 +1,32 @@
+{
+  "name": "markdown-studio",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "check": "svelte-check --tsconfig ./tsconfig.json",
+    "tauri": "tauri",
+    "desktop": "tauri dev"
+  },
+  "dependencies": {
+    "@fontsource/dm-sans": "latest",
+    "@fontsource/ibm-plex-mono": "latest",
+    "@fontsource/ibm-plex-sans": "latest",
+    "@fontsource/source-serif-4": "latest",
+    "@tauri-apps/api": "latest",
+    "@tauri-apps/plugin-dialog": "latest",
+    "highlight.js": "latest",
+    "marked": "latest",
+    "svelte": "latest"
+  },
+  "devDependencies": {
+    "@sveltejs/vite-plugin-svelte": "latest",
+    "@tauri-apps/cli": "latest",
+    "@types/node": "^26.1.1",
+    "svelte-check": "latest",
+    "typescript": "^5.9.3",
+    "vite": "latest"
+  }
+}
