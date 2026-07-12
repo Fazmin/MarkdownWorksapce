@@ -3,6 +3,7 @@
   import { marked } from "marked";
   import hljs from "highlight.js/lib/common";
   import { invoke } from "@tauri-apps/api/core";
+  import { listen } from "@tauri-apps/api/event";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { open, save } from "@tauri-apps/plugin-dialog";
@@ -72,6 +73,7 @@
   let showPublish = false;
   let showLibrary = false;
   let showSettings = false;
+  let showSidePanels = true;
   let busy = false;
   let toast = "";
   let savedProjects: SavedProject[] = [];
@@ -190,8 +192,18 @@
       .replaceAll('"', "&quot;");
   }
 
+  async function loadPendingOpenFiles() {
+    try {
+      const paths = await invoke<string[]>("take_opened_files");
+      if (paths.length) await loadPaths(paths, { quickView: true });
+    } catch (error) {
+      notify(`Unable to open Markdown file: ${String(error)}`);
+    }
+  }
+
   onMount(() => {
-    let unlisten: (() => void) | undefined;
+    let unlistenDrop: (() => void) | undefined;
+    let unlistenOpen: (() => void) | undefined;
     const resize = () => updateMinimapLayout();
     window.addEventListener("resize", resize);
     if (isTauri) {
@@ -207,12 +219,17 @@
           }
         })
         .then((stopListening) => {
-          unlisten = stopListening;
+          unlistenDrop = stopListening;
         })
         .catch((error) => notify(`Drag and drop unavailable: ${String(error)}`));
+      void (async () => {
+        unlistenOpen = await listen("open-files-requested", loadPendingOpenFiles);
+        await loadPendingOpenFiles();
+      })();
     }
     return () => {
-      unlisten?.();
+      unlistenDrop?.();
+      unlistenOpen?.();
       window.removeEventListener("resize", resize);
     };
   });
@@ -327,6 +344,7 @@
     activeId = "";
     projectId = null;
     renderedHtml = "";
+    showSidePanels = true;
   }
 
   async function ingest(fileList: FileList | File[]) {
@@ -346,6 +364,7 @@
     activeId = files[0].id;
     projectName = files.length === 1 ? files[0].name : "New collection";
     projectId = null;
+    showSidePanels = true;
   }
 
   async function chooseFiles() {
@@ -361,7 +380,7 @@
     if (path) await loadPaths([path]);
   }
 
-  async function loadPaths(paths: string[]) {
+  async function loadPaths(paths: string[], options: { quickView?: boolean } = {}) {
     busy = true;
     try {
       const loaded = await invoke<StudioFile[]>("read_markdown_paths", { paths });
@@ -371,6 +390,7 @@
       activeId = files[0].id;
       projectName = files.length === 1 ? files[0].name : String(paths[0]).split(/[\\/]/).pop() || "New collection";
       projectId = null;
+      showSidePanels = !options.quickView;
     } catch (error) {
       notify(String(error));
     } finally {
@@ -549,6 +569,7 @@
       fontSize = project.fontSize;
       typeface = project.typeface;
       exportOptions = project.exportOptions;
+      showSidePanels = true;
       showLibrary = false;
     } catch (error) {
       notify(String(error));
@@ -686,6 +707,17 @@
     {/if}
     <div class="top-actions">
       {#if files.length}
+        <button
+          class:active={showSidePanels}
+          class="workspace-toggle"
+          title={showSidePanels ? "Hide side panels" : "Show organizer and settings"}
+          aria-label={showSidePanels ? "Hide side panels" : "Show organizer and settings"}
+          aria-pressed={showSidePanels}
+          on:click={() => showSidePanels = !showSidePanels}
+        >
+          <svg viewBox="0 0 20 20"><rect x="2.5" y="3" width="15" height="14" rx="2"/><path d="M6.5 3v14M13.5 3v14"/></svg>
+          <span>{showSidePanels ? "Clean view" : "More"}</span>
+        </button>
         <button class="icon-button" title="Save project" aria-label="Save project" on:click={saveProject}>
           <svg viewBox="0 0 24 24"><path d="M5 4h12l2 2v14H5zM8 4v6h8V4M8 20v-6h8v6"/></svg>
         </button>
@@ -760,7 +792,7 @@
       </section>
     </main>
   {:else}
-    <main class="workspace">
+    <main class:clean-view={!showSidePanels} class="workspace">
       <aside class="organizer" class:single={files.length === 1}>
         <div class="project-heading">
           <span>{files.length === 1 ? "Document" : "Collection"}</span>

@@ -5,8 +5,9 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
+    sync::Mutex,
 };
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -83,6 +84,73 @@ struct ProjectSummary {
     name: String,
     updated_at: String,
     file_count: usize,
+}
+
+#[derive(Default)]
+struct PendingOpenFiles(Mutex<Vec<String>>);
+
+fn is_markdown_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("md") || extension.eq_ignore_ascii_case("markdown")
+        })
+}
+
+fn open_paths_from_arguments(
+    arguments: impl IntoIterator<Item = String>,
+    working_directory: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for argument in arguments {
+        if argument.starts_with('-') {
+            continue;
+        }
+        let mut path = if argument.starts_with("file://") {
+            match tauri::Url::parse(&argument)
+                .ok()
+                .and_then(|url| url.to_file_path().ok())
+            {
+                Some(path) => path,
+                None => continue,
+            }
+        } else {
+            PathBuf::from(argument)
+        };
+        if path.is_relative() {
+            if let Some(directory) = working_directory {
+                path = directory.join(path);
+            }
+        }
+        if is_markdown_path(&path) && !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    paths
+}
+
+fn queue_open_files(app: &AppHandle, paths: Vec<PathBuf>, notify_frontend: bool) {
+    if paths.is_empty() {
+        return;
+    }
+    let state = app.state::<PendingOpenFiles>();
+    let mut pending = state.0.lock().unwrap_or_else(|error| error.into_inner());
+    for path in paths {
+        let path = path.to_string_lossy().into_owned();
+        if !pending.contains(&path) {
+            pending.push(path);
+        }
+    }
+    drop(pending);
+    if notify_frontend {
+        let _ = app.emit("open-files-requested", ());
+    }
+}
+
+#[tauri::command]
+fn take_opened_files(state: State<'_, PendingOpenFiles>) -> Vec<String> {
+    let mut pending = state.0.lock().unwrap_or_else(|error| error.into_inner());
+    std::mem::take(&mut *pending)
 }
 
 fn database(app: &AppHandle) -> Result<Connection, String> {
@@ -824,9 +892,42 @@ fn escape_xml(value: &str) -> String {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tauri::Builder::default()
+    let mut builder = tauri::Builder::default().manage(PendingOpenFiles::default());
+
+    #[cfg(desktop)]
+    {
+        builder = builder.plugin(tauri_plugin_single_instance::init(
+            |app, arguments, working_directory| {
+                let paths = open_paths_from_arguments(
+                    arguments.into_iter().skip(1),
+                    Some(Path::new(&working_directory)),
+                );
+                queue_open_files(app, paths, true);
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.unminimize();
+                    let _ = window.set_focus();
+                }
+            },
+        ));
+    }
+
+    let application = builder
         .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            #[cfg(any(windows, target_os = "linux"))]
+            {
+                let working_directory = std::env::current_dir().ok();
+                let paths = open_paths_from_arguments(
+                    std::env::args().skip(1),
+                    working_directory.as_deref(),
+                );
+                queue_open_files(app.handle(), paths, false);
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
+            take_opened_files,
             render_markdown,
             read_markdown_paths,
             save_project,
@@ -834,8 +935,23 @@ pub fn run() {
             load_project,
             export_document
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Markdown Studio");
+        .build(tauri::generate_context!())
+        .expect("error while building Markdown Studio");
+
+    application.run(
+        #[allow(unused_variables)]
+        |app, event| {
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            if let tauri::RunEvent::Opened { urls } = event {
+                let paths = urls
+                    .into_iter()
+                    .filter_map(|url| url.to_file_path().ok())
+                    .filter(|path| is_markdown_path(path))
+                    .collect();
+                queue_open_files(app, paths, true);
+            }
+        },
+    );
 }
 
 #[cfg(test)]
@@ -907,5 +1023,34 @@ mod tests {
         let html = markdown_html(&markdown);
         assert!(html.starts_with("<h1>Large document</h1>"));
         assert!(html.contains("Paragraph 19999"));
+    }
+
+    #[test]
+    fn accepts_markdown_file_arguments_only() {
+        let directory = std::env::temp_dir();
+        let paths = open_paths_from_arguments(
+            vec![
+                "--flag".to_string(),
+                "notes.txt".to_string(),
+                "chapter.md".to_string(),
+                "appendix.markdown".to_string(),
+            ],
+            Some(&directory),
+        );
+        assert_eq!(
+            paths,
+            vec![
+                directory.join("chapter.md"),
+                directory.join("appendix.markdown")
+            ]
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn accepts_windows_absolute_markdown_paths() {
+        let path = r"C:\Users\Example\Documents\chapter.md";
+        let paths = open_paths_from_arguments(vec![path.to_string()], None);
+        assert_eq!(paths, vec![PathBuf::from(path)]);
     }
 }

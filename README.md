@@ -23,6 +23,12 @@ Everything stays on your device. There are no accounts, uploads, or external con
 - Print the current file or an entire collection
 - Work comfortably in light or dark mode
 
+## Opening files from the desktop
+
+Packaged builds register Markdown Studio as a handler for `.md` and `.markdown` files. Use **Open with → Markdown Studio** from the system file manager to load a document in a clean quick-view layout. Use the **More** title-bar toggle when you want the organizer and settings sidebars. If the app is already running, the existing window is focused and receives the file instead of opening a second instance.
+
+File associations are registered by the platform installer, so reinstall the app after association configuration changes during development.
+
 ## Getting started
 
 ### Prerequisites

@@ -147,6 +147,22 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .icon-button { width: 36px; display: grid; place-items: center; padding: 8px; }
 .icon-button svg { width: 18px; fill: none; stroke: currentColor; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
 .quiet-button { font-size: 13px; font-weight: 500; color: #6b6861; }
+.workspace-toggle {
+  height: 32px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid color-mix(in srgb, var(--shell-ink) 14%, transparent);
+  border-radius: 8px 8px 8px 3px;
+  padding: 0 9px;
+  background: color-mix(in srgb, var(--shell-ink) 3%, transparent);
+  color: color-mix(in srgb, var(--shell-ink) 67%, transparent);
+  font-size: 11px;
+  cursor: pointer;
+}
+.workspace-toggle:hover { border-color: color-mix(in srgb, var(--shell-ink) 26%, transparent); color: var(--shell-ink); }
+.workspace-toggle.active { background: color-mix(in srgb, var(--shell-ink) 8%, transparent); color: var(--shell-ink); }
+.workspace-toggle svg { width: 15px; height: 15px; fill: none; stroke: currentColor; stroke-width: 1.2; }
 .theme-toggle {
   width: 52px;
   height: 28px;
@@ -305,6 +321,9 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .feature-strip b { color: #413f3a; font-size: 11px; }
 
 .workspace { height: calc(100% - 64px); display: grid; grid-template-columns: 230px minmax(440px, 1fr) 224px; overflow: hidden; }
+.workspace.clean-view { grid-template-columns: minmax(0, 1fr); }
+.workspace.clean-view > .organizer,
+.workspace.clean-view > .theme-rail { display: none; }
 .organizer { border-right: 1px solid rgba(43,41,37,.11); min-width: 0; display: flex; flex-direction: column; background: var(--shell-deep); }
 .project-heading { padding: 24px 18px 17px; border-bottom: 1px solid rgba(43,41,37,.09); }
 .project-heading > span { color: #9c4a32; font-size: 11px; text-transform: uppercase; letter-spacing: .15em; font-weight: 600; }
@@ -642,6 +661,8 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 @media (max-width: 790px) {
   .brand > span:last-child { display: none; }
   .titlebar-search { width: 175px; margin-right: 5px; }
+  .workspace-toggle span { display: none; }
+  .workspace-toggle { width: 34px; justify-content: center; padding: 0; }
   .document-stats { grid-template-columns: repeat(4, minmax(44px, 1fr)) 24px; }
   .document-stats .stats-heading,
   .document-stats > span:nth-child(3),
