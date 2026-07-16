@@ -1,8 +1,8 @@
 # Markdown Studio
 
-**A calm, local-first workspace for reading, organizing, and publishing Markdown.**
+**A smilple, minimalistic workspace for reading, organizing, and publishing Markdown.**
 
-Markdown Studio turns a single Markdown file—or an entire folder—into a polished, cohesive document. Arrange sections, choose comfortable typography, and publish to PDF, DOCX, self-contained HTML, or one combined Markdown file.
+Markdown Studio turns a single Markdown file or an entire folder into a polished, cohesive document. Arrange sections, choose comfortable typography, and publish to PDF, DOCX, self-contained HTML, or one combined Markdown file.
 
 ## Why I built it
 
