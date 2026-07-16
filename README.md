@@ -6,9 +6,9 @@ Markdown Studio turns a single Markdown file or an entire folder into a polished
 
 ## Why I built it
 
-I enjoy writing in Markdown because it stays out of the way. Publishing that writing, however, often means reaching for a much larger tool or maintaining a collection of conversion scripts.
+Writing in Markdown is valued for its simplicity and unobtrusiveness. However, publishing Markdown content often requires the use of complex tools or maintaining multiple conversion scripts.
 
-Markdown Studio is my attempt to make that final step feel as simple as the writing itself: open your files, put them in order, make them pleasant to read, and publish. It is intentionally focused—not a replacement for a full word processor, but a thoughtfully designed home for Markdown documents.
+Markdown Studio is my attempt to make that final step feel as simple as the writing itself: open your files, put them in order, make them pleasant to read, and publish. It is intentionally focused not a replacement for a full word processor, but a thoughtfully designed home for Markdown documents with the required, most useful functionalities.
 
 Everything stays on your device. There are no accounts, uploads, or external conversion programs.
 
