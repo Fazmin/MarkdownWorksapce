@@ -36,6 +36,7 @@
     width: number;
     kind: "text" | "heading" | "code" | "list";
   };
+  type ContentWidth = "theme" | "wide" | "extra-wide";
 
   const isTauri = "__TAURI_INTERNALS__" in window;
   const appWindow = isTauri ? getCurrentWindow() : null;
@@ -52,6 +53,7 @@
   let activeTheme: ThemeTokens = window.matchMedia("(prefers-color-scheme: dark)").matches ? themes[3] : themes[0];
   let fontSize = 18;
   let typeface: keyof typeof typefaces = "serif";
+  let contentWidth: ContentWidth = "theme";
   let renderedHtml = "";
   let search = "";
   let searchCount = 0;
@@ -106,13 +108,14 @@
     `--heading-font:${activeTheme.fontHeading}`,
     `--reader-size:${fontSize}px`,
     `--reader-leading:${activeTheme.lineHeight}`,
-    `--measure:${activeTheme.measure}px`,
+    `--measure:${contentWidth === "wide" ? 960 : contentWidth === "extra-wide" ? 1240 : activeTheme.measure}px`,
     `--paragraph-gap:${activeTheme.paragraphGap}em`
   ].join(";");
   $: if (showMinimap && renderedHtml) {
     activeTheme;
     fontSize;
     typeface;
+    contentWidth;
     tick().then(updateMinimapLayout);
   }
 
@@ -530,6 +533,7 @@
       theme: activeTheme,
       fontSize,
       typeface,
+      contentWidth,
       exportOptions
     };
   }
@@ -568,6 +572,9 @@
       activeTheme = themes.find((theme) => theme.id === project.theme.id) ?? project.theme;
       fontSize = project.fontSize;
       typeface = project.typeface;
+      contentWidth = ["theme", "wide", "extra-wide"].includes(project.contentWidth)
+        ? project.contentWidth
+        : "theme";
       exportOptions = project.exportOptions;
       showSidePanels = true;
       showLibrary = false;
@@ -900,6 +907,18 @@
             <button class:active={typeface === "serif"} on:click={() => typeface = "serif"}><b style={`font-family:${typefaces.serif}`}>Aa</b><span>Serif</span></button>
             <button class:active={typeface === "sans"} on:click={() => typeface = "sans"}><b style={`font-family:${typefaces.sans}`}>Aa</b><span>Sans</span></button>
             <button class:active={typeface === "mono"} on:click={() => typeface = "mono"}><b style={`font-family:${typefaces.mono}`}>Aa</b><span>Mono</span></button>
+          </div>
+          <span class="setting-name">Content width</span>
+          <div class="content-width-options" aria-label="Content width">
+            <button class:active={contentWidth === "theme"} aria-pressed={contentWidth === "theme"} on:click={() => contentWidth = "theme"}>
+              <i class="width-preview width-preview-theme"></i><span>Theme</span>
+            </button>
+            <button class:active={contentWidth === "wide"} aria-pressed={contentWidth === "wide"} on:click={() => contentWidth = "wide"}>
+              <i class="width-preview width-preview-wide"></i><span>Wide</span>
+            </button>
+            <button class:active={contentWidth === "extra-wide"} aria-pressed={contentWidth === "extra-wide"} on:click={() => contentWidth = "extra-wide"}>
+              <i class="width-preview width-preview-extra"></i><span>Extra wide</span>
+            </button>
           </div>
         </section>
         <section class="settings-section navigation-settings">

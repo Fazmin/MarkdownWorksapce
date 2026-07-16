@@ -52,6 +52,10 @@ struct ExportOptions {
     footer_right: String,
 }
 
+fn default_content_width() -> String {
+    "theme".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Project {
@@ -61,6 +65,8 @@ struct Project {
     theme: ThemeTokens,
     font_size: f32,
     typeface: String,
+    #[serde(default = "default_content_width")]
+    content_width: String,
     export_options: ExportOptions,
 }
 

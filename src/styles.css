@@ -543,6 +543,16 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .typeface-options button.active { border-color: #a24c32; background: color-mix(in srgb, #a24c32 8%, transparent); color: var(--shell-ink); box-shadow: inset 0 0 0 1px rgba(162,76,50,.08); }
 .typeface-options b { font-size: 16px; font-weight: 500; line-height: 1; }
 .typeface-options span { font-size: 10px; }
+.content-width-options { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 5px; }
+.content-width-options button { min-width: 0; height: 51px; border: 1px solid color-mix(in srgb, var(--shell-ink) 12%, transparent); border-radius: 8px 8px 8px 2px; background: color-mix(in srgb, var(--shell-ink) 2%, transparent); color: color-mix(in srgb, var(--shell-ink) 58%, transparent); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 7px; cursor: pointer; }
+.content-width-options button:hover { border-color: color-mix(in srgb, var(--shell-ink) 27%, transparent); color: var(--shell-ink); }
+.content-width-options button.active { border-color: #a24c32; background: color-mix(in srgb, #a24c32 8%, transparent); color: var(--shell-ink); box-shadow: inset 0 0 0 1px rgba(162,76,50,.08); }
+.content-width-options span { overflow: hidden; font-size: 9.5px; text-overflow: ellipsis; white-space: nowrap; }
+.width-preview { width: 32px; height: 8px; border: 1px solid color-mix(in srgb, currentColor 38%, transparent); border-radius: 2px; display: flex; align-items: center; justify-content: center; }
+.width-preview::after { content: ""; display: block; height: 2px; border-radius: 1px; background: currentColor; opacity: .72; }
+.width-preview-theme::after { width: 12px; }
+.width-preview-wide::after { width: 21px; }
+.width-preview-extra::after { width: 28px; }
 .setting-toggle { width: 100%; min-height: 52px; border: 1px solid color-mix(in srgb, var(--shell-ink) 12%, transparent); border-radius: 9px 9px 9px 3px; background: color-mix(in srgb, var(--shell-ink) 3%, transparent); padding: 9px 10px; display: flex; align-items: center; justify-content: space-between; gap: 8px; text-align: left; cursor: pointer; }
 .setting-toggle:hover { border-color: color-mix(in srgb, var(--shell-ink) 24%, transparent); }
 .setting-toggle > span { min-width: 0; }
