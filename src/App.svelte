@@ -61,6 +61,7 @@
   let searchLimited = false;
   let articleEl: HTMLElement;
   let readerEl: HTMLElement;
+  let readerFrameEl: HTMLElement;
   let minimapEl: HTMLElement;
   let showMinimap = true;
   let showDocumentStats = true;
@@ -78,6 +79,10 @@
   let showSidePanels = true;
   let busy = false;
   let toast = "";
+  let selectionMenu = { visible: false, x: 0, y: 0, text: "" };
+  let selectionTimer = 0;
+  let speaking = false;
+  let currentUtterance: SpeechSynthesisUtterance | null = null;
   let savedProjects: SavedProject[] = [];
   let projectId: number | null = null;
   let fileInput: HTMLInputElement;
@@ -209,6 +214,7 @@
     let unlistenOpen: (() => void) | undefined;
     const resize = () => updateMinimapLayout();
     window.addEventListener("resize", resize);
+    document.addEventListener("selectionchange", scheduleSelectionMenu);
     if (isTauri) {
       getCurrentWebview()
         .onDragDropEvent((event) => {
@@ -234,6 +240,9 @@
       unlistenDrop?.();
       unlistenOpen?.();
       window.removeEventListener("resize", resize);
+      document.removeEventListener("selectionchange", scheduleSelectionMenu);
+      window.clearTimeout(selectionTimer);
+      stopSpeaking();
     };
   });
 
@@ -328,12 +337,81 @@
     });
   }
 
+  function scheduleSelectionMenu() {
+    window.clearTimeout(selectionTimer);
+    selectionTimer = window.setTimeout(updateSelectionMenu, 140);
+  }
+
+  function updateSelectionMenu() {
+    const selection = window.getSelection();
+    const text = selection && !selection.isCollapsed ? selection.toString().trim() : "";
+    if (
+      !selection || !text || !articleEl || !readerFrameEl ||
+      !articleEl.contains(selection.anchorNode) ||
+      !articleEl.contains(selection.focusNode)
+    ) {
+      if (selectionMenu.visible) selectionMenu = { ...selectionMenu, visible: false };
+      return;
+    }
+    const rect = selection.getRangeAt(0).getBoundingClientRect();
+    if (!rect.width && !rect.height) return;
+    const frame = readerFrameEl.getBoundingClientRect();
+    const x = Math.min(Math.max(rect.left + rect.width / 2 - frame.left, 58), Math.max(58, frame.width - 58));
+    const above = rect.top - frame.top - 48;
+    const y = Math.min(Math.max(above >= 8 ? above : rect.bottom - frame.top + 10, 8), Math.max(8, frame.height - 48));
+    selectionMenu = { visible: true, x, y, text };
+  }
+
+  function hideSelectionMenu() {
+    if (selectionMenu.visible) selectionMenu = { ...selectionMenu, visible: false };
+  }
+
+  function onReaderScroll() {
+    updateMinimapViewport();
+    if (selectionMenu.visible) updateSelectionMenu();
+  }
+
+  async function copySelection() {
+    if (!selectionMenu.text) return;
+    try {
+      await navigator.clipboard.writeText(selectionMenu.text);
+      notify("Copied to clipboard");
+    } catch {
+      notify(document.execCommand("copy") ? "Copied to clipboard" : "Unable to copy selection");
+    }
+  }
+
+  function speakSelection() {
+    if (!("speechSynthesis" in window)) return notify("Read aloud is not available on this system");
+    if (!selectionMenu.text) return;
+    speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(selectionMenu.text);
+    currentUtterance = utterance;
+    utterance.onend = utterance.onerror = () => {
+      if (currentUtterance === utterance) {
+        speaking = false;
+        currentUtterance = null;
+      }
+    };
+    speaking = true;
+    speechSynthesis.speak(utterance);
+  }
+
+  function stopSpeaking() {
+    if (!("speechSynthesis" in window)) return;
+    currentUtterance = null;
+    speechSynthesis.cancel();
+    speaking = false;
+  }
+
   function ordered(incoming: StudioFile[]) {
     const number = (name: string) => Number(name.match(/(?:^|[\\/])(\d+)/)?.[1] ?? Number.MAX_SAFE_INTEGER);
     return incoming.sort((a, b) => number(a.name) - number(b.name) || a.name.localeCompare(b.name));
   }
 
   function clearSessionCaches() {
+    stopSpeaking();
+    hideSelectionMenu();
     renderCache.clear();
     statsCache.clear();
     renderCacheBytes = 0;
@@ -661,6 +739,10 @@
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "p") { event.preventDefault(); printDocument(); }
     if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === "t") toggleThemeMode();
     if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === "e") { event.preventDefault(); showPublish = true; }
+    if (event.key === "Escape") {
+      if (speaking) stopSpeaking();
+      hideSelectionMenu();
+    }
   }
 </script>
 
@@ -836,13 +918,37 @@
         </div>
       </aside>
 
-      <section class="reader-frame" style={documentStyle} data-mode={activeTheme.mode}>
-        <div id="document-reader" bind:this={readerEl} class="reader" on:scroll={updateMinimapViewport}>
+      <section bind:this={readerFrameEl} class="reader-frame" style={documentStyle} data-mode={activeTheme.mode}>
+        <div id="document-reader" bind:this={readerEl} class="reader" on:scroll={onReaderScroll}>
           <article bind:this={articleEl} class="markdown-body">
             {@html renderedHtml}
           </article>
           <footer class="reader-end"><span>End of {activeFile?.name}</span></footer>
         </div>
+        {#if selectionMenu.visible}
+          <div
+            class="selection-menu"
+            role="toolbar"
+            tabindex="-1"
+            aria-label="Selection actions"
+            style={`left:${selectionMenu.x}px;top:${selectionMenu.y}px`}
+            on:pointerdown|preventDefault
+          >
+            <button title="Read out loud" aria-label="Read selection out loud" on:click={speakSelection}>
+              <svg viewBox="0 0 24 24"><path d="M11 5 6 9H2v6h4l5 4z"/><path d="M15.5 8.5a5 5 0 0 1 0 7"/><path d="M18.6 5.4a9 9 0 0 1 0 13.2"/></svg>
+            </button>
+            <button title="Copy" aria-label="Copy selection" on:click={copySelection}>
+              <svg viewBox="0 0 24 24"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+            </button>
+          </div>
+        {/if}
+        {#if speaking}
+          <div class="speech-pill" role="status">
+            <span class="speech-wave" aria-hidden="true"><i></i><i></i><i></i></span>
+            <span>Reading aloud</span>
+            <button on:click={stopSpeaking}>Stop</button>
+          </div>
+        {/if}
         {#if showMinimap}
           <div
             bind:this={minimapEl}
