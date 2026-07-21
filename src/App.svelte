@@ -6,10 +6,11 @@
   import { listen } from "@tauri-apps/api/event";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
   import { getCurrentWindow } from "@tauri-apps/api/window";
-  import { open, save } from "@tauri-apps/plugin-dialog";
+  import { open, save, confirm } from "@tauri-apps/plugin-dialog";
   import { themes, typefaces, type ThemeTokens } from "./lib/themes";
+  import type { EditorHandle } from "./lib/editor";
 
-  type StudioFile = { id: string; name: string; path?: string; content: string };
+  type StudioFile = { id: string; name: string; path?: string; content: string; savedContent: string };
   type SavedProject = { id: number; name: string; updated_at: string; file_count: number };
   type ExportOptions = {
     toc: boolean;
@@ -83,6 +84,12 @@
   let selectionTimer = 0;
   let speaking = false;
   let currentUtterance: SpeechSynthesisUtterance | null = null;
+  let editMode = false;
+  let editorHandle: EditorHandle | null = null;
+  let editorPaneEl: HTMLElement;
+  let editingFileId = "";
+  let editTimer = 0;
+  let pendingContent: string | null = null;
   let savedProjects: SavedProject[] = [];
   let projectId: number | null = null;
   let fileInput: HTMLInputElement;
@@ -99,6 +106,12 @@
   };
 
   $: activeFile = files.find((file) => file.id === activeId) ?? files[0];
+  $: activeDirty = activeFile ? activeFile.content !== activeFile.savedContent : false;
+  $: if (editMode && editorHandle && activeFile && activeFile.id !== editingFileId) {
+    flushEdits();
+    editingFileId = activeFile.id;
+    editorHandle.setDoc(activeFile.content);
+  }
   $: documentStats = getDocumentStats(activeFile);
   $: minimapBlocks = buildMinimapBlocks(activeFile?.content ?? "");
   $: if (activeFile) renderFile(activeFile);
@@ -212,6 +225,7 @@
   onMount(() => {
     let unlistenDrop: (() => void) | undefined;
     let unlistenOpen: (() => void) | undefined;
+    let unlistenClose: (() => void) | undefined;
     const resize = () => updateMinimapLayout();
     window.addEventListener("resize", resize);
     document.addEventListener("selectionchange", scheduleSelectionMenu);
@@ -235,14 +249,31 @@
         unlistenOpen = await listen("open-files-requested", loadPendingOpenFiles);
         await loadPendingOpenFiles();
       })();
+      appWindow
+        ?.onCloseRequested(async (event) => {
+          try {
+            flushEdits();
+            if (!files.some((file) => file.content !== file.savedContent)) return;
+            const leave = await confirm("You have unsaved changes. Close anyway?", { title: "Markdown Studio", kind: "warning" });
+            if (!leave) event.preventDefault();
+          } catch {
+            // fail open: a broken dialog must never block closing the window
+          }
+        })
+        .then((stopListening) => {
+          unlistenClose = stopListening;
+        })
+        .catch(() => {});
     }
     return () => {
       unlistenDrop?.();
       unlistenOpen?.();
+      unlistenClose?.();
       window.removeEventListener("resize", resize);
       document.removeEventListener("selectionchange", scheduleSelectionMenu);
       window.clearTimeout(selectionTimer);
       stopSpeaking();
+      teardownEditor();
     };
   });
 
@@ -404,6 +435,78 @@
     speaking = false;
   }
 
+  function onEditorChange(text: string) {
+    pendingContent = text;
+    window.clearTimeout(editTimer);
+    editTimer = window.setTimeout(flushEdits, 200);
+  }
+
+  function flushEdits() {
+    window.clearTimeout(editTimer);
+    if (pendingContent === null) return;
+    const text = pendingContent;
+    const targetId = editingFileId;
+    pendingContent = null;
+    files = files.map((file) => file.id === targetId ? { ...file, content: text } : file);
+  }
+
+  async function toggleEditMode() {
+    if (editMode) return teardownEditor();
+    editMode = true;
+    const { createEditor } = await import("./lib/editor");
+    await tick();
+    if (!editMode || editorHandle || !editorPaneEl) return;
+    editingFileId = activeFile?.id ?? "";
+    editorHandle = createEditor(editorPaneEl, activeFile?.content ?? "", onEditorChange);
+    editorHandle.view.focus();
+  }
+
+  function teardownEditor() {
+    flushEdits();
+    pendingContent = null;
+    editingFileId = "";
+    editorHandle?.destroy();
+    editorHandle = null;
+    editMode = false;
+  }
+
+  async function saveActiveFile() {
+    flushEdits();
+    const file = files.find((candidate) => candidate.id === activeId) ?? files[0];
+    if (!file) return;
+    if (!isTauri) {
+      const blob = new Blob([file.content], { type: "text/markdown" });
+      const anchor = document.createElement("a");
+      anchor.href = URL.createObjectURL(blob);
+      anchor.download = `${file.name}.md`;
+      anchor.click();
+      files = files.map((candidate) => candidate.id === file.id ? { ...candidate, savedContent: candidate.content } : candidate);
+      return notify("Downloaded a copy — the browser cannot write to the original file");
+    }
+    let path = file.path;
+    if (!path) {
+      const chosen = await save({
+        defaultPath: `${file.name.replace(/[<>:"/\\|?*]/g, "-")}.md`,
+        filters: [{ name: "Markdown", extensions: ["md"] }]
+      });
+      if (!chosen) return;
+      path = chosen;
+    }
+    busy = true;
+    try {
+      await invoke("write_markdown_file", { path, content: file.content });
+      const savedName = path.split(/[\\/]/).pop()!.replace(/\.(md|markdown)$/i, "");
+      files = files.map((candidate) => candidate.id === file.id
+        ? { ...candidate, path, name: candidate.path ? candidate.name : savedName, savedContent: candidate.content }
+        : candidate);
+      notify("Saved");
+    } catch (error) {
+      notify(String(error));
+    } finally {
+      busy = false;
+    }
+  }
+
   function ordered(incoming: StudioFile[]) {
     const number = (name: string) => Number(name.match(/(?:^|[\\/])(\d+)/)?.[1] ?? Number.MAX_SAFE_INTEGER);
     return incoming.sort((a, b) => number(a.name) - number(b.name) || a.name.localeCompare(b.name));
@@ -412,6 +515,7 @@
   function clearSessionCaches() {
     stopSpeaking();
     hideSelectionMenu();
+    teardownEditor();
     renderCache.clear();
     statsCache.clear();
     renderCacheBytes = 0;
@@ -433,11 +537,15 @@
     if (!markdownFiles.length) return notify("No Markdown files found");
     const loaded: StudioFile[] = [];
     for (let index = 0; index < markdownFiles.length; index += 8) {
-      const batch = await Promise.all(markdownFiles.slice(index, index + 8).map(async (file) => ({
-        id: crypto.randomUUID(),
-        name: file.name.replace(/\.md(?:own)?$/i, ""),
-        content: await file.text()
-      })));
+      const batch = await Promise.all(markdownFiles.slice(index, index + 8).map(async (file) => {
+        const content = await file.text();
+        return {
+          id: crypto.randomUUID(),
+          name: file.name.replace(/\.md(?:own)?$/i, ""),
+          content,
+          savedContent: content
+        };
+      }));
       loaded.push(...batch);
     }
     clearSessionCaches();
@@ -464,9 +572,9 @@
   async function loadPaths(paths: string[], options: { quickView?: boolean } = {}) {
     busy = true;
     try {
-      const loaded = await invoke<StudioFile[]>("read_markdown_paths", { paths });
+      const loaded = await invoke<Omit<StudioFile, "id" | "savedContent">[]>("read_markdown_paths", { paths });
       clearSessionCaches();
-      files = ordered(loaded.map((file) => ({ ...file, id: crypto.randomUUID() })));
+      files = ordered(loaded.map((file) => ({ ...file, id: crypto.randomUUID(), savedContent: file.content })));
       if (!files.length) return notify("No Markdown files found");
       activeId = files[0].id;
       projectName = files.length === 1 ? files[0].name : String(paths[0]).split(/[\\/]/).pop() || "New collection";
@@ -503,6 +611,7 @@
     statsCache.delete(id);
     files = files.filter((file) => file.id !== id);
     if (activeId === id) activeId = files[Math.min(index, files.length - 1)]?.id ?? "";
+    if (!files.length) teardownEditor();
   }
 
   function scheduleSearch(delay = 160) {
@@ -617,6 +726,7 @@
   }
 
   async function saveProject() {
+    flushEdits();
     if (!isTauri) return notify("Project saving is available in the desktop app");
     busy = true;
     try {
@@ -645,7 +755,7 @@
       clearSessionCaches();
       projectId = project.id;
       projectName = project.name;
-      files = project.files.map((file: any) => ({ ...file, id: crypto.randomUUID() }));
+      files = project.files.map((file: any) => ({ ...file, id: crypto.randomUUID(), savedContent: file.content }));
       activeId = files[0]?.id ?? "";
       activeTheme = themes.find((theme) => theme.id === project.theme.id) ?? project.theme;
       fontSize = project.fontSize;
@@ -662,6 +772,7 @@
   }
 
   async function exportDocument(format: "pdf" | "docx" | "html" | "md") {
+    flushEdits();
     if (!isTauri) {
       if (format !== "html" && format !== "md") return notify("PDF and DOCX export require the desktop app");
       const content = format === "md"
@@ -692,7 +803,9 @@
   }
 
   async function printDocument() {
-    const selectedFiles = printAllFiles ? files : activeFile ? [activeFile] : [];
+    flushEdits();
+    const currentFile = files.find((file) => file.id === activeId) ?? files[0];
+    const selectedFiles = printAllFiles ? files : currentFile ? [currentFile] : [];
     if (!selectedFiles.length) return;
     busy = true;
     try {
@@ -737,6 +850,10 @@
     if ((event.ctrlKey || event.metaKey) && event.key === "=") { event.preventDefault(); fontSize = Math.min(fontSize + 1, 28); }
     if ((event.ctrlKey || event.metaKey) && event.key === "-") { event.preventDefault(); fontSize = Math.max(fontSize - 1, 13); }
     if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "p") { event.preventDefault(); printDocument(); }
+    if ((event.ctrlKey || event.metaKey) && !event.shiftKey && event.key.toLowerCase() === "s") {
+      event.preventDefault();
+      if (editMode) saveActiveFile();
+    }
     if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === "t") toggleThemeMode();
     if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === "e") { event.preventDefault(); showPublish = true; }
     if (event.key === "Escape") {
@@ -748,6 +865,7 @@
 
 <svelte:window
   on:keydown={handleKeydown}
+  on:beforeunload={(event) => { if (!isTauri && files.some((file) => file.content !== file.savedContent)) event.preventDefault(); }}
   on:dragover={(event) => { event.preventDefault(); dragActive = true; }}
   on:dragleave={(event) => { if (event.relatedTarget === null) dragActive = false; }}
   on:drop={onDrop}
@@ -807,6 +925,29 @@
           <svg viewBox="0 0 20 20"><rect x="2.5" y="3" width="15" height="14" rx="2"/><path d="M6.5 3v14M13.5 3v14"/></svg>
           <span>{showSidePanels ? "Clean view" : "More"}</span>
         </button>
+        <button
+          class:active={editMode}
+          class="workspace-toggle"
+          title={editMode ? "Close the editor" : "Edit Markdown source"}
+          aria-label={editMode ? "Close the editor" : "Edit Markdown source"}
+          aria-pressed={editMode}
+          on:click={toggleEditMode}
+        >
+          <svg viewBox="0 0 20 20"><path d="m13.2 3.6 3.2 3.2L7 16.2l-4 .8.8-4z"/></svg>
+          <span>Edit</span>
+        </button>
+        {#if editMode}
+          <button
+            class="workspace-toggle save-button"
+            title={activeFile?.path ?? "Choose where to save"}
+            aria-label="Save file"
+            on:click={saveActiveFile}
+          >
+            <svg viewBox="0 0 20 20"><path d="M4 3h10l3 3v11H4zM7 3v4h6V3M7 17v-5h6v5"/></svg>
+            <span>Save</span>
+            {#if activeDirty}<i class="save-dot"></i>{/if}
+          </button>
+        {/if}
         <button class="icon-button" title="Save project" aria-label="Save project" on:click={saveProject}>
           <svg viewBox="0 0 24 24"><path d="M5 4h12l2 2v14H5zM8 4v6h8V4M8 20v-6h8v6"/></svg>
         </button>
@@ -900,7 +1041,7 @@
             >
               <span class="grip">⠿</span>
               <span class="file-number">{String(index + 1).padStart(2, "0")}</span>
-              <span class="file-name">{file.name}</span>
+              <span class="file-name"><span>{file.name}</span>{#if file.content !== file.savedContent}<i class="dirty-dot"></i>{/if}</span>
               <span
                 class="remove"
                 role="button"
@@ -918,7 +1059,10 @@
         </div>
       </aside>
 
-      <section bind:this={readerFrameEl} class="reader-frame" style={documentStyle} data-mode={activeTheme.mode}>
+      <section bind:this={readerFrameEl} class:editing={editMode} class="reader-frame" style={documentStyle} data-mode={activeTheme.mode}>
+        {#if editMode}
+          <div class="editor-pane" bind:this={editorPaneEl}></div>
+        {/if}
         <div id="document-reader" bind:this={readerEl} class="reader" on:scroll={onReaderScroll}>
           <article bind:this={articleEl} class="markdown-body">
             {@html renderedHtml}
@@ -949,7 +1093,7 @@
             <button on:click={stopSpeaking}>Stop</button>
           </div>
         {/if}
-        {#if showMinimap}
+        {#if showMinimap && !editMode}
           <div
             bind:this={minimapEl}
             class="document-minimap"

@@ -263,6 +263,23 @@ fn read_markdown_paths_blocking(paths: Vec<String>) -> Result<Vec<StudioFile>, S
         .collect()
 }
 
+#[tauri::command]
+async fn write_markdown_file(path: String, content: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || write_markdown_file_blocking(path, content))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+fn write_markdown_file_blocking(path: String, content: String) -> Result<(), String> {
+    let path = Path::new(&path);
+    if let Some(parent) = path.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+        if !parent.exists() {
+            return Err(format!("Folder no longer exists: {}", parent.display()));
+        }
+    }
+    fs::write(path, content).map_err(|error| format!("Unable to save {}: {error}", path.display()))
+}
+
 fn collect_markdown(path: &Path, output: &mut Vec<PathBuf>) -> Result<(), String> {
     if path.is_dir() {
         for entry in fs::read_dir(path).map_err(|error| error.to_string())? {
@@ -936,6 +953,7 @@ pub fn run() {
             take_opened_files,
             render_markdown,
             read_markdown_paths,
+            write_markdown_file,
             save_project,
             list_projects,
             load_project,
