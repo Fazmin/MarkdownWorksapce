@@ -21,11 +21,15 @@ Everything stays on your device. There are no accounts, uploads, or external con
 - Save and reopen projects through a local SQLite-backed library
 - Export to PDF, DOCX, self-contained HTML, or combined Markdown
 - Print the current file or an entire collection
+- Add page numbers (left, center, or right; `1`, `Page 1`, or `Page 1 of 9`) and choose narrow, normal, or wide page margins for printing and every export
+- Open several documents side by side, each in its own window
 - Work comfortably in light or dark mode
 
 ## Opening files from the desktop
 
-Packaged builds register Markdown Studio as a handler for `.md` and `.markdown` files. Use **Open with → Markdown Studio** from the system file manager to load a document in a clean quick-view layout. Use the **More** title-bar toggle when you want the organizer and settings sidebars. If the app is already running, the existing window is focused and receives the file instead of opening a second instance.
+Packaged builds register Markdown Studio as a handler for `.md` and `.markdown` files. Use **Open with → Markdown Studio** from the system file manager to load a document in a clean quick-view layout. Use the **More** title-bar toggle when you want the organizer and settings sidebars.
+
+Each document can have its own window. Opening another file while the app is running opens it in a new window, leaving your current documents untouched; a window still on the welcome screen is reused instead. Use the **New window** title-bar button or **Ctrl/⌘ + Shift + N** to start an empty window. Every window has its own files, theme, and unsaved-changes prompt, and the window title shows the document name so they are easy to tell apart in the taskbar.
 
 File associations are registered by the platform installer, so reinstall the app after association configuration changes during development.
 

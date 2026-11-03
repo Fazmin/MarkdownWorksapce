@@ -2,12 +2,20 @@ use pulldown_cmark::{html, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::{HashMap, HashSet},
     fs,
     io::Write,
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Mutex, MutexGuard,
+    },
 };
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow, WebviewWindowBuilder, WindowEvent};
+
+const MAIN_WINDOW: &str = "main";
+const OPEN_FILES_EVENT: &str = "open-files-requested";
+static NEXT_WINDOW_NUMBER: AtomicUsize = AtomicUsize::new(1);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -44,12 +52,86 @@ struct ThemeTokens {
 struct ExportOptions {
     toc: bool,
     page_numbers: bool,
+    #[serde(default = "default_page_number_position")]
+    page_number_position: String,
+    #[serde(default = "default_page_number_format")]
+    page_number_format: String,
+    #[serde(default = "default_margins")]
+    margins: String,
+    #[serde(default)]
     header_left: String,
+    #[serde(default)]
     header_center: String,
+    #[serde(default)]
     header_right: String,
+    #[serde(default)]
     footer_left: String,
+    #[serde(default)]
     footer_center: String,
+    #[serde(default)]
     footer_right: String,
+}
+
+fn default_page_number_position() -> String {
+    "center".to_string()
+}
+
+fn default_page_number_format() -> String {
+    "number".to_string()
+}
+
+fn default_margins() -> String {
+    "normal".to_string()
+}
+
+/// Page margins in millimetres.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct PageMargins {
+    top: f32,
+    right: f32,
+    bottom: f32,
+    left: f32,
+}
+
+fn page_margins(preset: &str) -> PageMargins {
+    match preset {
+        "narrow" => PageMargins { top: 12.7, right: 12.7, bottom: 12.7, left: 12.7 },
+        "wide" => PageMargins { top: 25.4, right: 50.8, bottom: 25.4, left: 50.8 },
+        _ => PageMargins { top: 25.4, right: 25.4, bottom: 25.4, left: 25.4 },
+    }
+}
+
+fn page_number_template(options: &ExportOptions) -> Option<&'static str> {
+    if !options.page_numbers {
+        return None;
+    }
+    Some(match options.page_number_format.as_str() {
+        "page" => "Page {page}",
+        "page-of" => "Page {page} of {pages}",
+        _ => "{page}",
+    })
+}
+
+/// Header and footer templates for the left, center, and right slots. When page numbers are
+/// enabled they are merged into the chosen footer slot, after any text already there.
+fn running_slots(options: &ExportOptions) -> ([String; 3], [String; 3]) {
+    let header = [&options.header_left, &options.header_center, &options.header_right]
+        .map(|value| value.trim().to_string());
+    let mut footer = [&options.footer_left, &options.footer_center, &options.footer_right]
+        .map(|value| value.trim().to_string());
+    if let Some(template) = page_number_template(options) {
+        let slot = match options.page_number_position.as_str() {
+            "left" => 0,
+            "right" => 2,
+            _ => 1,
+        };
+        footer[slot] = if footer[slot].is_empty() {
+            template.to_string()
+        } else {
+            format!("{} · {template}", footer[slot])
+        };
+    }
+    (header, footer)
 }
 
 fn default_content_width() -> String {
@@ -92,8 +174,16 @@ struct ProjectSummary {
     file_count: usize,
 }
 
+/// Per-window bookkeeping: Markdown paths waiting to be loaded by a window, and the windows that
+/// currently show the empty welcome screen and can therefore take the next opened file.
 #[derive(Default)]
-struct PendingOpenFiles(Mutex<Vec<String>>);
+struct WindowState {
+    pending: HashMap<String, Vec<String>>,
+    idle: HashSet<String>,
+}
+
+#[derive(Default)]
+struct Windows(Mutex<WindowState>);
 
 fn is_markdown_path(path: &Path) -> bool {
     path.extension()
@@ -135,28 +225,161 @@ fn open_paths_from_arguments(
     paths
 }
 
-fn queue_open_files(app: &AppHandle, paths: Vec<PathBuf>, notify_frontend: bool) {
-    if paths.is_empty() {
-        return;
-    }
-    let state = app.state::<PendingOpenFiles>();
-    let mut pending = state.0.lock().unwrap_or_else(|error| error.into_inner());
+fn lock_windows(app: &AppHandle) -> MutexGuard<'_, WindowState> {
+    app.state::<Windows>()
+        .inner()
+        .0
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
+fn queue_for_window(state: &mut WindowState, label: &str, paths: Vec<PathBuf>) {
+    let queue = state.pending.entry(label.to_string()).or_default();
     for path in paths {
         let path = path.to_string_lossy().into_owned();
-        if !pending.contains(&path) {
-            pending.push(path);
+        if !queue.contains(&path) {
+            queue.push(path);
         }
     }
-    drop(pending);
-    if notify_frontend {
-        let _ = app.emit("open-files-requested", ());
+    state.idle.remove(label);
+}
+
+fn focus_window(window: &WebviewWindow) {
+    let _ = window.show();
+    let _ = window.unminimize();
+    let _ = window.set_focus();
+}
+
+/// Sends files opened from the operating system (or a repeated launch) to a window. An idle
+/// window on the welcome screen is reused; otherwise a new window is opened so documents that
+/// are already open stay untouched.
+fn route_open_request(app: &AppHandle, paths: Vec<PathBuf>) {
+    let reused = {
+        let mut state = lock_windows(app);
+        let mut idle_labels: Vec<String> = state.idle.iter().cloned().collect();
+        idle_labels.sort_by_key(|label| label != MAIN_WINDOW);
+        let target = idle_labels
+            .into_iter()
+            .find_map(|label| app.get_webview_window(&label).map(|window| (label, window)));
+        if let Some((label, _)) = &target {
+            if !paths.is_empty() {
+                queue_for_window(&mut state, label, paths.clone());
+            }
+        }
+        target
+    };
+    match reused {
+        Some((label, window)) => {
+            if !paths.is_empty() {
+                let _ = app.emit(OPEN_FILES_EVENT, label);
+            }
+            focus_window(&window);
+        }
+        None => spawn_document_window(app.clone(), paths),
+    }
+}
+
+/// Window creation deadlocks on Windows when it runs inside an event handler, so it is moved
+/// onto the async runtime.
+fn spawn_document_window(app: AppHandle, paths: Vec<PathBuf>) {
+    tauri::async_runtime::spawn(async move {
+        if let Err(error) = create_document_window(&app, paths) {
+            eprintln!("Unable to open a Markdown Studio window: {error}");
+        }
+    });
+}
+
+fn create_document_window(app: &AppHandle, paths: Vec<PathBuf>) -> Result<WebviewWindow, String> {
+    let label = loop {
+        let candidate = format!(
+            "document-{}",
+            NEXT_WINDOW_NUMBER.fetch_add(1, Ordering::Relaxed)
+        );
+        if app.get_webview_window(&candidate).is_none() {
+            break candidate;
+        }
+    };
+    let mut config = app
+        .config()
+        .app
+        .windows
+        .iter()
+        .find(|window| window.label == MAIN_WINDOW)
+        .cloned()
+        .ok_or("The main window configuration is missing")?;
+    config.label = label.clone();
+    if let Some((x, y)) = cascade_position(app, config.width, config.height) {
+        config.center = false;
+        config.x = Some(x);
+        config.y = Some(y);
+    }
+    {
+        let mut state = lock_windows(app);
+        if paths.is_empty() {
+            state.idle.insert(label.clone());
+        } else {
+            queue_for_window(&mut state, &label, paths);
+        }
+    }
+    let window = WebviewWindowBuilder::from_config(app, &config)
+        .and_then(|builder| builder.build())
+        .map_err(|error| {
+            let mut state = lock_windows(app);
+            state.pending.remove(&label);
+            state.idle.remove(&label);
+            error.to_string()
+        })?;
+    focus_window(&window);
+    Ok(window)
+}
+
+/// Offsets a new window from the focused one so it does not land exactly on top of it, wrapping
+/// back to the monitor's corner when the cascade would run off screen.
+fn cascade_position(app: &AppHandle, width: f64, height: f64) -> Option<(f64, f64)> {
+    let windows = app.webview_windows();
+    let source = windows
+        .values()
+        .find(|window| window.is_focused().unwrap_or(false))
+        .or_else(|| windows.get(MAIN_WINDOW))?;
+    if source.is_maximized().unwrap_or(false) || source.is_minimized().unwrap_or(false) {
+        return None;
+    }
+    let scale = source.scale_factor().ok()?;
+    let position = source.outer_position().ok()?.to_logical::<f64>(scale);
+    let (mut x, mut y) = (position.x + 32.0, position.y + 32.0);
+    if let Some(monitor) = source.current_monitor().ok().flatten() {
+        let origin = monitor.position().to_logical::<f64>(monitor.scale_factor());
+        let size = monitor.size().to_logical::<f64>(monitor.scale_factor());
+        if x + width > origin.x + size.width || y + height > origin.y + size.height {
+            x = origin.x + 48.0;
+            y = origin.y + 48.0;
+        }
+    }
+    Some((x, y))
+}
+
+#[tauri::command]
+fn take_opened_files(window: WebviewWindow, state: State<'_, Windows>) -> Vec<String> {
+    let mut state = state.0.lock().unwrap_or_else(|error| error.into_inner());
+    state.pending.remove(window.label()).unwrap_or_default()
+}
+
+/// The frontend reports whether its window is on the empty welcome screen.
+#[tauri::command]
+fn set_window_idle(window: WebviewWindow, idle: bool, state: State<'_, Windows>) {
+    let label = window.label().to_string();
+    let mut state = state.0.lock().unwrap_or_else(|error| error.into_inner());
+    let has_pending = state.pending.get(&label).is_some_and(|queue| !queue.is_empty());
+    if idle && !has_pending {
+        state.idle.insert(label);
+    } else {
+        state.idle.remove(&label);
     }
 }
 
 #[tauri::command]
-fn take_opened_files(state: State<'_, PendingOpenFiles>) -> Vec<String> {
-    let mut pending = state.0.lock().unwrap_or_else(|error| error.into_inner());
-    std::mem::take(&mut *pending)
+async fn open_new_window(app: AppHandle) -> Result<(), String> {
+    create_document_window(&app, Vec::new()).map(|_| ())
 }
 
 fn database(app: &AppHandle) -> Result<Connection, String> {
@@ -481,8 +704,9 @@ a{{color:var(--accent)}} blockquote{{border-left:3px solid var(--accent);padding
 table{{border-collapse:collapse;width:100%}} td,th{{border-bottom:1px solid var(--rule);padding:.55em;text-align:left}}
 .source-file{{break-before:page;min-height:80vh}}.source-file:first-of-type{{break-before:auto}}.source-label{{font:10px ui-sans-serif;text-transform:uppercase;letter-spacing:.14em;color:var(--accent);margin-bottom:3em}}
 .toc{{break-after:page;min-height:80vh}}.toc ol{{padding:0;list-style:none}}.toc li{{border-bottom:1px solid var(--rule);padding:.7em 0}}.toc a{{display:block;text-decoration:none}}
-@page{{margin:22mm 18mm}} @media print{{main{{padding:0}}}}
+{page_css} @media print{{main{{padding:0;max-width:none}} pre{{white-space:pre-wrap;overflow-wrap:anywhere}} h1,h2,h3,h4{{break-after:avoid;break-inside:avoid}} img,tr{{break-inside:avoid}} p,li{{orphans:3;widows:3}} .source-file,.toc{{min-height:0}}}}
 </style></head><body><main>{toc_page}{body}</main></body></html>"#,
+        page_css = print_page_css(request),
         paper = theme.paper,
         ink = theme.ink,
         muted = theme.muted,
@@ -494,6 +718,82 @@ table{{border-collapse:collapse;width:100%}} td,th{{border-bottom:1px solid var(
         measure = theme.measure,
         gap = theme.paragraph_gap,
     )
+}
+
+/// The `@page` rule for printed HTML: margins from the chosen preset, plus header, footer, and
+/// page number text in the page-margin boxes (supported by Chromium 131 and later).
+fn print_page_css(request: &ExportRequest) -> String {
+    let margins = page_margins(&request.export_options.margins);
+    let (header, footer) = running_slots(&request.export_options);
+    let mut boxes = String::new();
+    for (names, slots) in [
+        (["top-left", "top-center", "top-right"], header),
+        (["bottom-left", "bottom-center", "bottom-right"], footer),
+    ] {
+        for (name, template) in names.iter().zip(slots.iter()) {
+            if !template.is_empty() {
+                boxes.push_str(&format!(
+                    "@{name}{{content:{};font:8.5pt ui-sans-serif,system-ui,sans-serif;color:{}}}",
+                    css_content(template, request),
+                    request.theme.muted
+                ));
+            }
+        }
+    }
+    format!(
+        "@page{{margin:{}mm {}mm {}mm {}mm;{boxes}}}",
+        margins.top, margins.right, margins.bottom, margins.left
+    )
+}
+
+/// Converts a header or footer template into a CSS `content` value, mapping `{page}` and
+/// `{pages}` to the page counters.
+fn css_content(template: &str, request: &ExportRequest) -> String {
+    let text = template
+        .replace("{title}", &request.name)
+        .replace("{date}", &chrono::Local::now().format("%Y-%m-%d").to_string());
+    let mut parts = Vec::new();
+    let mut literal = String::new();
+    let mut rest = text.as_str();
+    while !rest.is_empty() {
+        let counter = if rest.starts_with("{pages}") {
+            Some(("counter(pages)", 7))
+        } else if rest.starts_with("{page}") {
+            Some(("counter(page)", 6))
+        } else {
+            None
+        };
+        if let Some((counter, length)) = counter {
+            if !literal.is_empty() {
+                parts.push(css_string(&std::mem::take(&mut literal)));
+            }
+            parts.push(counter.to_string());
+            rest = &rest[length..];
+        } else {
+            let character = rest.chars().next().unwrap();
+            literal.push(character);
+            rest = &rest[character.len_utf8()..];
+        }
+    }
+    if !literal.is_empty() || parts.is_empty() {
+        parts.push(css_string(&literal));
+    }
+    parts.join(" ")
+}
+
+fn css_string(value: &str) -> String {
+    let mut output = String::from("\"");
+    for character in value.chars() {
+        match character {
+            '"' => output.push_str("\\\""),
+            '\\' => output.push_str("\\\\"),
+            '<' => output.push_str("\\3c "),
+            '\n' | '\r' => output.push(' '),
+            character => output.push(character),
+        }
+    }
+    output.push('"');
+    output
 }
 
 fn markdown_text(markdown: &str) -> Vec<String> {
@@ -549,97 +849,238 @@ fn headings(markdown: &str) -> Vec<String> {
     output
 }
 
-fn write_pdf(path: &Path, request: &ExportRequest) -> Result<(), String> {
-    let size = request.font_size.clamp(9.0, 20.0);
-    let chars_per_line = (82.0 * (12.0 / size)).round().max(38.0) as usize;
-    let lines_per_page = (55.0 * (12.0 / size)).round().clamp(34.0, 65.0) as usize;
-    let mut pages: Vec<Vec<String>> = Vec::new();
-    if request.export_options.toc {
-        let mut toc = vec!["CONTENTS".to_string(), String::new()];
-        for (index, file) in request.files.iter().enumerate() {
-            toc.push(format!("{:02}   {}", index + 1, file.name));
-            for heading in headings(&file.content).into_iter().take(5) {
-                toc.push(format!("      {heading}"));
-            }
+const PDF_PAGE_WIDTH: f32 = 595.0;
+const PDF_PAGE_HEIGHT: f32 = 842.0;
+const PT_PER_MM: f32 = 72.0 / 25.4;
+const PDF_RUNNING_SIZE: f32 = 8.5;
+
+/// Advance widths of Helvetica for ASCII 32..=126, in 1/1000 em (Adobe core font metrics).
+const HELVETICA_WIDTHS: [u16; 95] = [
+    278, 278, 355, 556, 556, 889, 667, 222, 333, 333, 389, 584, 278, 333, 278, 278, 556, 556, 556,
+    556, 556, 556, 556, 556, 556, 556, 278, 278, 584, 584, 584, 556, 1015, 667, 667, 722, 722, 667,
+    611, 778, 722, 278, 500, 667, 556, 833, 722, 778, 667, 778, 722, 667, 611, 722, 667, 944, 667,
+    667, 611, 278, 278, 278, 469, 556, 222, 556, 556, 500, 556, 556, 278, 556, 556, 222, 222, 500,
+    222, 833, 556, 556, 556, 556, 333, 500, 278, 556, 500, 722, 500, 500, 500, 334, 260, 334, 584,
+];
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PdfStyle {
+    Title,
+    Heading,
+    Body,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct PdfLine {
+    style: PdfStyle,
+    text: String,
+    x: f32,
+    baseline: f32,
+    size: f32,
+}
+
+/// Text width in points as drawn after `pdf_escape` (tabs become four spaces, other non-ASCII
+/// characters become `?`). Bold text is estimated slightly wider than regular Helvetica.
+fn text_width(text: &str, size: f32, bold: bool) -> f32 {
+    let units: u32 = text
+        .chars()
+        .map(|character| match character {
+            ' '..='~' => HELVETICA_WIDTHS[character as usize - 32] as u32,
+            '\t' => 4 * 278,
+            _ => 556,
+        })
+        .sum();
+    units as f32 / 1000.0 * size * if bold { 1.1 } else { 1.0 }
+}
+
+/// Places lines top to bottom inside the page margins, starting a new page whenever the next
+/// line would cross the bottom margin.
+struct PdfPaginator {
+    pages: Vec<Vec<PdfLine>>,
+    current: Vec<PdfLine>,
+    cursor: f32,
+    top: f32,
+    bottom: f32,
+    left: f32,
+    width: f32,
+    base_size: f32,
+    line_height: f32,
+}
+
+impl PdfPaginator {
+    fn new(margins: PageMargins, base_size: f32, line_height: f32) -> Self {
+        let top = PDF_PAGE_HEIGHT - margins.top * PT_PER_MM;
+        Self {
+            pages: Vec::new(),
+            current: Vec::new(),
+            cursor: top,
+            top,
+            bottom: margins.bottom * PT_PER_MM,
+            left: margins.left * PT_PER_MM,
+            width: PDF_PAGE_WIDTH - (margins.left + margins.right) * PT_PER_MM,
+            base_size,
+            line_height,
         }
-        pages.push(toc);
-    }
-    for file in &request.files {
-        let mut source_lines = vec![file.name.to_uppercase(), String::new()];
-        for line in markdown_text(&file.content) {
-            source_lines.extend(wrap_text(&line, chars_per_line));
-        }
-        if source_lines.is_empty() {
-            source_lines.push(String::new());
-        }
-        for chunk in source_lines.chunks(lines_per_page) {
-            pages.push(chunk.to_vec());
-        }
-    }
-    if pages.is_empty() {
-        pages.push(vec![request.name.clone()]);
     }
 
+    fn font_size(&self, style: PdfStyle) -> f32 {
+        match style {
+            PdfStyle::Title => self.base_size * 1.28,
+            PdfStyle::Heading => self.base_size * 1.12,
+            PdfStyle::Body => self.base_size,
+        }
+    }
+
+    fn page_break(&mut self) {
+        if !self.current.is_empty() {
+            self.pages.push(std::mem::take(&mut self.current));
+        }
+        self.cursor = self.top;
+    }
+
+    fn gap(&mut self, amount: f32) {
+        if !self.current.is_empty() {
+            self.cursor -= amount;
+        }
+    }
+
+    fn paragraph(&mut self, style: PdfStyle, text: &str, indent: f32) {
+        let size = self.font_size(style);
+        let bold = style != PdfStyle::Body;
+        let available = (self.width - indent).max(size * 4.0);
+        let advance = size * self.line_height;
+        for line in wrap_text(text, |candidate| text_width(candidate, size, bold) <= available) {
+            if self.cursor - advance < self.bottom && !self.current.is_empty() {
+                self.page_break();
+            }
+            // Centre the glyphs in the line box so ascenders and descenders stay inside it.
+            let baseline = self.cursor - (advance - size) / 2.0 - size * 0.8;
+            self.cursor -= advance;
+            self.current.push(PdfLine {
+                style,
+                text: line,
+                x: self.left + indent,
+                baseline,
+                size,
+            });
+        }
+    }
+
+    fn finish(mut self) -> Vec<Vec<PdfLine>> {
+        self.page_break();
+        self.pages
+    }
+}
+
+fn layout_pdf(request: &ExportRequest) -> Vec<Vec<PdfLine>> {
+    let margins = page_margins(&request.export_options.margins);
+    let size = request.font_size.clamp(9.0, 20.0);
+    let line_height = request.theme.line_height.clamp(1.0, 2.4);
+    let paragraph_gap = size * request.theme.paragraph_gap.clamp(0.3, 2.0) * 0.8;
+    let mut layout = PdfPaginator::new(margins, size, line_height);
+    if request.export_options.toc {
+        layout.paragraph(PdfStyle::Title, "CONTENTS", 0.0);
+        layout.gap(paragraph_gap);
+        for (index, file) in request.files.iter().enumerate() {
+            layout.paragraph(PdfStyle::Body, &format!("{:02}   {}", index + 1, file.name), 0.0);
+            for heading in headings(&file.content).into_iter().take(5) {
+                layout.paragraph(PdfStyle::Body, &heading, size * 2.4);
+            }
+        }
+        layout.page_break();
+    }
+    for file in &request.files {
+        layout.paragraph(PdfStyle::Title, &file.name.to_uppercase(), 0.0);
+        layout.gap(paragraph_gap);
+        for line in markdown_text(&file.content) {
+            if line.is_empty() {
+                layout.gap(paragraph_gap);
+            } else if let Some(heading) = line.strip_prefix("# ") {
+                layout.gap(paragraph_gap * 0.5);
+                layout.paragraph(PdfStyle::Heading, heading, 0.0);
+            } else {
+                layout.paragraph(PdfStyle::Body, &line, 0.0);
+            }
+        }
+        layout.page_break();
+    }
+    let pages = layout.finish();
+    if !pages.is_empty() {
+        return pages;
+    }
+    let mut fallback = PdfPaginator::new(margins, size, line_height);
+    fallback.paragraph(PdfStyle::Title, &request.name, 0.0);
+    fallback.finish()
+}
+
+fn write_pdf(path: &Path, request: &ExportRequest) -> Result<(), String> {
+    let pages = layout_pdf(request);
+    let margins = page_margins(&request.export_options.margins);
+    let (header, footer) = running_slots(&request.export_options);
     let (paper_r, paper_g, paper_b) = rgb(&request.theme.paper);
     let (ink_r, ink_g, ink_b) = rgb(&request.theme.ink);
     let (accent_r, accent_g, accent_b) = rgb(&request.theme.accent);
+    let (muted_r, muted_g, muted_b) = rgb(&request.theme.muted);
     let page_count = pages.len();
     let mut objects = Vec::<Vec<u8>>::new();
     objects.push(b"<< /Type /Catalog /Pages 2 0 R >>".to_vec());
     let kids = (0..page_count)
-        .map(|index| format!("{} 0 R", 4 + index * 2))
+        .map(|index| format!("{} 0 R", 5 + index * 2))
         .collect::<Vec<_>>()
         .join(" ");
     objects.push(format!("<< /Type /Pages /Kids [{kids}] /Count {page_count} >>").into_bytes());
     objects.push(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec());
+    objects.push(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>".to_vec());
+
+    // Running text sits in the middle of the top and bottom margins.
+    let header_baseline =
+        PDF_PAGE_HEIGHT - margins.top * PT_PER_MM / 2.0 - PDF_RUNNING_SIZE * 0.35;
+    let footer_baseline = margins.bottom * PT_PER_MM / 2.0 - PDF_RUNNING_SIZE * 0.35;
+    let left_edge = margins.left * PT_PER_MM;
+    let right_edge = PDF_PAGE_WIDTH - margins.right * PT_PER_MM;
 
     for (index, lines) in pages.iter().enumerate() {
-        let page_id = 4 + index * 2;
-        let content_id = page_id + 1;
+        let content_id = 6 + index * 2;
         objects.push(
             format!(
-                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 3 0 R >> >> /Contents {content_id} 0 R >>"
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 {PDF_PAGE_WIDTH} {PDF_PAGE_HEIGHT}] /Resources << /Font << /F1 3 0 R /F2 4 0 R >> >> /Contents {content_id} 0 R >>"
             )
             .into_bytes(),
         );
         let mut stream = format!(
-            "{paper_r:.3} {paper_g:.3} {paper_b:.3} rg 0 0 595 842 re f\n{ink_r:.3} {ink_g:.3} {ink_b:.3} rg\nBT /F1 {size:.1} Tf {leading:.1} TL 62 774 Td\n",
-            leading = size * request.theme.line_height
+            "{paper_r:.3} {paper_g:.3} {paper_b:.3} rg 0 0 {PDF_PAGE_WIDTH} {PDF_PAGE_HEIGHT} re f\n"
         );
-        for (line_index, line) in lines.iter().enumerate() {
-            if line_index == 0 {
+        for line in lines {
+            let (font, (red, green, blue)) = match line.style {
+                PdfStyle::Title => ("F2", (accent_r, accent_g, accent_b)),
+                PdfStyle::Heading => ("F2", (ink_r, ink_g, ink_b)),
+                PdfStyle::Body => ("F1", (ink_r, ink_g, ink_b)),
+            };
+            stream.push_str(&format!(
+                "{red:.3} {green:.3} {blue:.3} rg BT /{font} {:.2} Tf {:.2} {:.2} Td ({}) Tj ET\n",
+                line.size,
+                line.x,
+                line.baseline,
+                pdf_escape(&line.text)
+            ));
+        }
+        for (slots, baseline) in [(&header, header_baseline), (&footer, footer_baseline)] {
+            for (slot, template) in slots.iter().enumerate() {
+                let text = token_text(template, request, index + 1, page_count);
+                if text.is_empty() {
+                    continue;
+                }
+                let width = text_width(&text, PDF_RUNNING_SIZE, false);
+                let x = match slot {
+                    0 => left_edge,
+                    1 => (PDF_PAGE_WIDTH - width) / 2.0,
+                    _ => right_edge - width,
+                };
                 stream.push_str(&format!(
-                    "{accent_r:.3} {accent_g:.3} {accent_b:.3} rg /F1 {:.1} Tf ",
-                    size * 1.28
-                ));
-            } else if line_index == 1 {
-                stream.push_str(&format!(
-                    "{ink_r:.3} {ink_g:.3} {ink_b:.3} rg /F1 {size:.1} Tf "
+                    "{muted_r:.3} {muted_g:.3} {muted_b:.3} rg BT /F1 {PDF_RUNNING_SIZE} Tf {x:.2} {baseline:.2} Td ({}) Tj ET\n",
+                    pdf_escape(&text)
                 ));
             }
-            stream.push_str(&format!("({}) Tj T*\n", pdf_escape(line)));
-        }
-        stream.push_str("ET\n");
-        let header = token_text(&request.export_options.header_center, request, index + 1);
-        let footer_template = if request.export_options.page_numbers
-            && request.export_options.footer_center.is_empty()
-        {
-            "{page}"
-        } else {
-            &request.export_options.footer_center
-        };
-        let footer = token_text(footer_template, request, index + 1);
-        if !header.is_empty() {
-            stream.push_str(&format!(
-                "{ink_r:.3} {ink_g:.3} {ink_b:.3} rg BT /F1 8 Tf 250 814 Td ({}) Tj ET\n",
-                pdf_escape(&header)
-            ));
-        }
-        if !footer.is_empty() {
-            stream.push_str(&format!(
-                "{ink_r:.3} {ink_g:.3} {ink_b:.3} rg BT /F1 8 Tf 290 28 Td ({}) Tj ET\n",
-                pdf_escape(&footer)
-            ));
         }
         objects.push(
             format!(
@@ -675,23 +1116,33 @@ fn write_pdf(path: &Path, request: &ExportRequest) -> Result<(), String> {
     fs::write(path, output).map_err(|error| error.to_string())
 }
 
-fn wrap_text(text: &str, width: usize) -> Vec<String> {
-    if text.is_empty() {
-        return vec![String::new()];
-    }
+/// Greedy word wrap. `fits` decides whether a candidate line is narrow enough; a word that is
+/// too long on its own is split across lines so it never runs into the margin.
+fn wrap_text(text: &str, fits: impl Fn(&str) -> bool) -> Vec<String> {
     let mut lines = Vec::new();
     let mut current = String::new();
     for word in text.split_whitespace() {
-        if !current.is_empty() && current.chars().count() + word.chars().count() + 1 > width {
-            lines.push(current);
-            current = String::new();
+        let candidate = if current.is_empty() {
+            word.to_string()
+        } else {
+            format!("{current} {word}")
+        };
+        if fits(&candidate) {
+            current = candidate;
+            continue;
         }
         if !current.is_empty() {
-            current.push(' ');
+            lines.push(std::mem::take(&mut current));
         }
-        current.push_str(word);
+        for character in word.chars() {
+            current.push(character);
+            if current.chars().count() > 1 && !fits(&current) {
+                current.pop();
+                lines.push(std::mem::replace(&mut current, character.to_string()));
+            }
+        }
     }
-    if !current.is_empty() {
+    if !current.is_empty() || lines.is_empty() {
         lines.push(current);
     }
     lines
@@ -720,9 +1171,10 @@ fn pdf_escape(value: &str) -> String {
         .collect()
 }
 
-fn token_text(template: &str, request: &ExportRequest, page: usize) -> String {
+fn token_text(template: &str, request: &ExportRequest, page: usize, pages: usize) -> String {
     template
         .replace("{title}", &request.name)
+        .replace("{pages}", &pages.to_string())
         .replace("{page}", &page.to_string())
         .replace(
             "{date}",
@@ -761,26 +1213,22 @@ fn write_docx(path: &Path, request: &ExportRequest) -> Result<(), String> {
     let font_half_points = (request.font_size * 2.0).round() as u32;
     let color = request.theme.ink.trim_start_matches('#');
     let accent = request.theme.accent.trim_start_matches('#');
-    let header = word_header_footer(
-        &[
-            &request.export_options.header_left,
-            &request.export_options.header_center,
-            &request.export_options.header_right,
-        ],
-        request,
-        false,
+    let margins = page_margins(&request.export_options.margins);
+    let twips = |millimetres: f32| (millimetres * 1440.0 / 25.4).round() as u32;
+    let (top, right, bottom, left) = (
+        twips(margins.top),
+        twips(margins.right),
+        twips(margins.bottom),
+        twips(margins.left),
     );
-    let footer = word_header_footer(
-        &[
-            &request.export_options.footer_left,
-            &request.export_options.footer_center,
-            &request.export_options.footer_right,
-        ],
-        request,
-        request.export_options.page_numbers,
-    );
+    let content_width = 12240u32.saturating_sub(left + right).max(1440);
+    let (header_slots, footer_slots) = running_slots(&request.export_options);
+    let header = word_header_footer("hdr", &header_slots, request, content_width);
+    let footer = word_header_footer("ftr", &footer_slots, request, content_width);
     let document = format!(
-        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:body>{document_body}<w:sectPr><w:headerReference w:type="default" r:id="rId1"/><w:footerReference w:type="default" r:id="rId2"/><w:pgSz w:w="12240" w:h="15840"/><w:pgMar w:top="1224" w:right="1296" w:bottom="1224" w:left="1296"/></w:sectPr></w:body></w:document>"#
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><w:body>{document_body}<w:sectPr><w:headerReference w:type="default" r:id="rId1"/><w:footerReference w:type="default" r:id="rId2"/><w:pgSz w:w="12240" w:h="15840"/><w:pgMar w:top="{top}" w:right="{right}" w:bottom="{bottom}" w:left="{left}" w:header="{}" w:footer="{}" w:gutter="0"/></w:sectPr></w:body></w:document>"#,
+        top / 2,
+        bottom / 2
     );
     let styles = format!(
         r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:styles xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:docDefaults><w:rPrDefault><w:rPr><w:sz w:val="{font_half_points}"/><w:color w:val="{color}"/></w:rPr></w:rPrDefault><w:pPrDefault><w:pPr><w:spacing w:after="180" w:line="360" w:lineRule="auto"/></w:pPr></w:pPrDefault></w:docDefaults><w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style><w:style w:type="paragraph" w:styleId="Title"><w:name w:val="Title"/><w:rPr><w:color w:val="{accent}"/><w:sz w:val="52"/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="Heading1"><w:name w:val="heading 1"/><w:rPr><w:b/><w:sz w:val="34"/></w:rPr></w:style><w:style w:type="paragraph" w:styleId="Heading2"><w:name w:val="heading 2"/><w:rPr><w:b/><w:sz w:val="28"/></w:rPr></w:style></w:styles>"#
@@ -810,29 +1258,71 @@ fn word_paragraph(text: &str, style: Option<&str>) -> String {
     )
 }
 
-fn word_header_footer(fields: &[&String; 3], request: &ExportRequest, force_page: bool) -> String {
-    let tag = if force_page || fields.iter().any(|value| value.contains("{page}")) {
-        "ftr"
-    } else {
-        "hdr"
-    };
-    let cells = fields
+/// Builds a header (`hdr`) or footer (`ftr`) part with left, center, and right cells. `{page}`
+/// and `{pages}` become live PAGE and NUMPAGES fields so Word numbers every page.
+fn word_header_footer(
+    tag: &str,
+    slots: &[String; 3],
+    request: &ExportRequest,
+    content_width: u32,
+) -> String {
+    let muted = request.theme.muted.trim_start_matches('#');
+    let run_properties = format!(r#"<w:rPr><w:color w:val="{muted}"/><w:sz w:val="17"/></w:rPr>"#);
+    let column = content_width / 3;
+    let cells = slots
         .iter()
         .enumerate()
-        .map(|(index, value)| {
+        .map(|(index, template)| {
             let alignment = ["left", "center", "right"][index];
-            let text = token_text(value, request, 1);
-            let content = if value.contains("{page}") || (force_page && index == 1 && value.is_empty()) {
-                r#"<w:r><w:fldChar w:fldCharType="begin"/></w:r><w:r><w:instrText>PAGE</w:instrText></w:r><w:r><w:fldChar w:fldCharType="end"/></w:r>"#.to_string()
-            } else {
-                format!("<w:r><w:t>{}</w:t></w:r>", escape_xml(&text))
-            };
-            format!(r#"<w:tc><w:p><w:pPr><w:jc w:val="{alignment}"/></w:pPr>{content}</w:p></w:tc>"#)
+            let runs = word_template_runs(template, request, &run_properties);
+            format!(
+                r#"<w:tc><w:tcPr><w:tcW w:w="{column}" w:type="dxa"/></w:tcPr><w:p><w:pPr><w:spacing w:after="0" w:line="240" w:lineRule="auto"/><w:jc w:val="{alignment}"/></w:pPr>{runs}</w:p></w:tc>"#
+            )
         })
         .collect::<String>();
     format!(
-        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:{tag} xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:tbl><w:tblPr><w:tblW w:w="0" w:type="auto"/></w:tblPr><w:tblGrid><w:gridCol w:w="3240"/><w:gridCol w:w="3240"/><w:gridCol w:w="3240"/></w:tblGrid><w:tr>{cells}</w:tr></w:tbl></w:{tag}>"#
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><w:{tag} xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:tbl><w:tblPr><w:tblW w:w="{width}" w:type="dxa"/><w:tblLayout w:type="fixed"/></w:tblPr><w:tblGrid><w:gridCol w:w="{column}"/><w:gridCol w:w="{column}"/><w:gridCol w:w="{column}"/></w:tblGrid><w:tr>{cells}</w:tr></w:tbl><w:p><w:pPr><w:spacing w:after="0" w:line="20" w:lineRule="exact"/></w:pPr></w:p></w:{tag}>"#,
+        width = column * 3
     )
+}
+
+fn word_template_runs(template: &str, request: &ExportRequest, run_properties: &str) -> String {
+    let text = template
+        .replace("{title}", &request.name)
+        .replace("{date}", &chrono::Local::now().format("%Y-%m-%d").to_string());
+    let literal = |value: &str| {
+        if value.is_empty() {
+            String::new()
+        } else {
+            format!(
+                r#"<w:r>{run_properties}<w:t xml:space="preserve">{}</w:t></w:r>"#,
+                escape_xml(value)
+            )
+        }
+    };
+    let field = |instruction: &str| {
+        format!(
+            r#"<w:r>{run_properties}<w:fldChar w:fldCharType="begin"/></w:r><w:r>{run_properties}<w:instrText xml:space="preserve"> {instruction} </w:instrText></w:r><w:r>{run_properties}<w:fldChar w:fldCharType="separate"/></w:r><w:r>{run_properties}<w:t>1</w:t></w:r><w:r>{run_properties}<w:fldChar w:fldCharType="end"/></w:r>"#
+        )
+    };
+    let mut output = String::new();
+    let mut rest = text.as_str();
+    loop {
+        let next = [("{pages}", "NUMPAGES"), ("{page}", "PAGE")]
+            .into_iter()
+            .filter_map(|(token, instruction)| {
+                rest.find(token).map(|index| (index, token, instruction))
+            })
+            .min_by_key(|(index, token, _)| (*index, std::cmp::Reverse(token.len())));
+        let Some((index, token, instruction)) = next else {
+            output.push_str(&literal(rest));
+            break;
+        };
+        output.push_str(&literal(&rest[..index]));
+        output.push_str(&field(instruction));
+        rest = &rest[index + token.len()..];
+    }
+    output
 }
 
 fn write_store_zip(path: &Path, entries: &[(&str, &[u8])]) -> Result<(), String> {
@@ -915,8 +1405,10 @@ fn escape_xml(value: &str) -> String {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let mut builder = tauri::Builder::default().manage(PendingOpenFiles::default());
+    let mut builder = tauri::Builder::default().manage(Windows::default());
 
+    // A second launch (for example "Open with" on another file) is forwarded to this process,
+    // which opens it in its own window so every document gets an independent workspace.
     #[cfg(desktop)]
     {
         builder = builder.plugin(tauri_plugin_single_instance::init(
@@ -925,12 +1417,7 @@ pub fn run() {
                     arguments.into_iter().skip(1),
                     Some(Path::new(&working_directory)),
                 );
-                queue_open_files(app, paths, true);
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.show();
-                    let _ = window.unminimize();
-                    let _ = window.set_focus();
-                }
+                route_open_request(app, paths);
             },
         ));
     }
@@ -938,19 +1425,26 @@ pub fn run() {
     let application = builder
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
-            #[cfg(any(windows, target_os = "linux"))]
-            {
-                let working_directory = std::env::current_dir().ok();
-                let paths = open_paths_from_arguments(
-                    std::env::args().skip(1),
-                    working_directory.as_deref(),
-                );
-                queue_open_files(app.handle(), paths, false);
+            let paths = startup_paths();
+            let mut state = lock_windows(app.handle());
+            if paths.is_empty() {
+                state.idle.insert(MAIN_WINDOW.to_string());
+            } else {
+                queue_for_window(&mut state, MAIN_WINDOW, paths);
             }
             Ok(())
         })
+        .on_window_event(|window, event| {
+            if let WindowEvent::Destroyed = event {
+                let mut state = lock_windows(window.app_handle());
+                state.pending.remove(window.label());
+                state.idle.remove(window.label());
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             take_opened_files,
+            set_window_idle,
+            open_new_window,
             render_markdown,
             read_markdown_paths,
             write_markdown_file,
@@ -971,20 +1465,202 @@ pub fn run() {
                     .into_iter()
                     .filter_map(|url| url.to_file_path().ok())
                     .filter(|path| is_markdown_path(path))
-                    .collect();
-                queue_open_files(app, paths, true);
+                    .collect::<Vec<_>>();
+                if !paths.is_empty() {
+                    route_open_request(app, paths);
+                }
             }
         },
     );
+}
+
+/// Markdown files passed on the command line when the app starts (Windows and Linux; macOS
+/// delivers them through `RunEvent::Opened`).
+fn startup_paths() -> Vec<PathBuf> {
+    #[cfg(any(windows, target_os = "linux"))]
+    {
+        let working_directory = std::env::current_dir().ok();
+        open_paths_from_arguments(std::env::args().skip(1), working_directory.as_deref())
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        Vec::new()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn fits_chars(width: usize) -> impl Fn(&str) -> bool {
+        move |line: &str| line.chars().count() <= width
+    }
+
+    fn sample_request(options: ExportOptions, files: Vec<StudioFile>) -> ExportRequest {
+        ExportRequest {
+            id: None,
+            name: "Field \"Notes\"".into(),
+            files,
+            theme: ThemeTokens {
+                id: "classic".into(),
+                name: "Classic".into(),
+                mode: "light".into(),
+                paper: "#fbfaf6".into(),
+                ink: "#272621".into(),
+                muted: "#77736a".into(),
+                accent: "#b64a2e".into(),
+                rule: "#d8d3c8".into(),
+                code_bg: "#f0ede5".into(),
+                font_body: "serif".into(),
+                font_heading: "sans".into(),
+                base_size: 18.0,
+                line_height: 1.72,
+                measure: 690.0,
+                paragraph_gap: 1.15,
+            },
+            font_size: 18.0,
+            typeface: "serif".into(),
+            export_options: options,
+            format: "pdf".into(),
+            output_path: String::new(),
+        }
+    }
+
+    fn sample_options() -> ExportOptions {
+        ExportOptions {
+            toc: false,
+            page_numbers: true,
+            page_number_position: "center".into(),
+            page_number_format: "number".into(),
+            margins: "normal".into(),
+            header_left: String::new(),
+            header_center: "{title}".into(),
+            header_right: String::new(),
+            footer_left: String::new(),
+            footer_center: String::new(),
+            footer_right: String::new(),
+        }
+    }
+
+    fn long_file() -> StudioFile {
+        let mut content = String::from("# Long document\n\n");
+        for index in 0..120 {
+            content.push_str(&format!(
+                "Paragraph {index} has enough words to wrap across several printed lines on an A4 page with generous margins.\n\n"
+            ));
+        }
+        content.push_str("https://example.com/a-very-long-address-without-any-spaces-that-must-still-respect-the-right-margin-of-the-page\n");
+        StudioFile {
+            name: "Long".into(),
+            path: None,
+            content,
+        }
+    }
+
     #[test]
     fn wraps_without_losing_words() {
-        assert_eq!(wrap_text("one two three", 7), vec!["one two", "three"]);
+        assert_eq!(wrap_text("one two three", fits_chars(7)), vec!["one two", "three"]);
+    }
+
+    #[test]
+    fn wrap_splits_words_longer_than_a_line() {
+        assert_eq!(wrap_text("ab abcdefgh", fits_chars(3)), vec!["ab", "abc", "def", "gh"]);
+        assert_eq!(wrap_text("", fits_chars(3)), vec![String::new()]);
+    }
+
+    #[test]
+    fn page_numbers_join_their_footer_slot() {
+        let mut options = sample_options();
+        options.footer_center = "Draft".into();
+        options.page_number_format = "page-of".into();
+        let (header, footer) = running_slots(&options);
+        assert_eq!(header, ["", "{title}", ""].map(String::from));
+        assert_eq!(footer, ["", "Draft · Page {page} of {pages}", ""].map(String::from));
+
+        options.page_number_position = "right".into();
+        options.page_number_format = "page".into();
+        assert_eq!(running_slots(&options).1, ["", "Draft", "Page {page}"].map(String::from));
+
+        options.page_numbers = false;
+        assert_eq!(running_slots(&options).1, ["", "Draft", ""].map(String::from));
+    }
+
+    #[test]
+    fn legacy_export_options_default_to_centered_numbers_and_normal_margins() {
+        let options: ExportOptions = serde_json::from_str(
+            r#"{"toc":true,"pageNumbers":true,"headerLeft":"","headerCenter":"{title}","headerRight":"","footerLeft":"","footerCenter":"","footerRight":""}"#,
+        )
+        .unwrap();
+        assert_eq!(options.page_number_position, "center");
+        assert_eq!(options.page_number_format, "number");
+        assert_eq!(page_margins(&options.margins), page_margins("normal"));
+    }
+
+    #[test]
+    fn pdf_text_stays_inside_the_margins_on_every_page() {
+        for preset in ["narrow", "normal", "wide"] {
+            let mut options = sample_options();
+            options.margins = preset.into();
+            let request = sample_request(options, vec![long_file()]);
+            let margins = page_margins(preset);
+            let pages = layout_pdf(&request);
+            assert!(pages.len() > 3, "{preset}: expected several pages");
+            for line in pages.iter().flatten() {
+                let bold = line.style != PdfStyle::Body;
+                let right = line.x + text_width(&line.text, line.size, bold);
+                assert!(line.baseline - line.size * 0.25 >= margins.bottom * PT_PER_MM, "{preset}: {line:?}");
+                assert!(line.baseline + line.size <= PDF_PAGE_HEIGHT - margins.top * PT_PER_MM + 0.01, "{preset}: {line:?}");
+                assert!(line.x >= margins.left * PT_PER_MM - 0.01, "{preset}: {line:?}");
+                assert!(right <= PDF_PAGE_WIDTH - margins.right * PT_PER_MM + 0.01, "{preset}: {line:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn pdf_numbers_every_page() {
+        let mut options = sample_options();
+        options.page_number_format = "page-of".into();
+        let request = sample_request(options, vec![long_file()]);
+        let path = std::env::temp_dir().join(format!("markdown-studio-{}.pdf", std::process::id()));
+        write_pdf(&path, &request).unwrap();
+        let pdf = String::from_utf8_lossy(&fs::read(&path).unwrap()).into_owned();
+        let _ = fs::remove_file(path);
+        let pages = layout_pdf(&request).len();
+        for page in 1..=pages {
+            assert!(pdf.contains(&format!("(Page {page} of {pages}) Tj")), "missing page {page}");
+        }
+    }
+
+    #[test]
+    fn docx_footer_uses_page_fields_only_when_enabled() {
+        let mut options = sample_options();
+        options.page_number_format = "page-of".into();
+        let request = sample_request(options.clone(), Vec::new());
+        let (header, footer) = running_slots(&request.export_options);
+        let footer_xml = word_header_footer("ftr", &footer, &request, 9360);
+        assert!(footer_xml.contains("<w:ftr "));
+        assert_eq!(footer_xml.matches(" PAGE ").count(), 1);
+        assert_eq!(footer_xml.matches(" NUMPAGES ").count(), 1);
+        assert!(footer_xml.contains(">Page </w:t>"));
+        let header_xml = word_header_footer("hdr", &header, &request, 9360);
+        assert!(header_xml.contains("<w:hdr ") && header_xml.contains("Field &quot;Notes&quot;"));
+
+        options.page_numbers = false;
+        let request = sample_request(options, Vec::new());
+        let footer_xml = word_header_footer("ftr", &running_slots(&request.export_options).1, &request, 9360);
+        assert!(!footer_xml.contains("PAGE"));
+    }
+
+    #[test]
+    fn print_css_maps_tokens_to_page_counters() {
+        let request = sample_request(sample_options(), Vec::new());
+        assert_eq!(css_content("Page {page} of {pages}", &request), r#""Page " counter(page) " of " counter(pages)"#);
+        assert_eq!(css_content("{title}", &request), r#""Field \"Notes\"""#);
+        assert_eq!(css_content("</style>", &request), r#""\3c /style>""#);
+        let css = print_page_css(&request);
+        assert!(css.starts_with("@page{margin:25.4mm 25.4mm 25.4mm 25.4mm;"));
+        assert!(css.contains("@bottom-center{content:counter(page);"));
+        assert!(css.contains("@top-center{content:\"Field \\\"Notes\\\"\";"));
     }
 
     #[test]

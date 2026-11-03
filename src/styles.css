@@ -690,6 +690,12 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .field span { display: block; color: #8c877e; font-size: 10px; margin-bottom: 4px; }
 .field input { width: 100%; border: 1px solid #d4cfc6; background: #fffefa; border-radius: 7px; padding: 7px 9px; font-size: 10.5px; }
 .export-settings p { color: #9b968e; font-size: 9.5px; }
+.page-number-options { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px; margin: -4px 0 0 21px; }
+.page-number-options select { min-width: 0; border: 1px solid #d4cfc6; border-radius: 7px; background: #fffefa; padding: 0 6px; font-size: 10.5px; color: #3c3a35; }
+.segmented { display: grid; grid-auto-columns: minmax(0, 1fr); grid-auto-flow: column; padding: 2px; border: 1px solid #d4cfc6; border-radius: 7px; background: #ece8df; }
+.segmented button { min-width: 0; height: 24px; border: 0; border-radius: 5px; background: transparent; color: #7e7a72; font-size: 10px; cursor: pointer; }
+.segmented button:hover { color: #3c3a35; }
+.segmented button.active { background: #fffefa; color: #a24d34; font-weight: 600; box-shadow: 0 1px 3px rgba(52,45,36,.12); }
 .export-settings code { color: #68645d; background: #e7e2d8; padding: 2px 4px; border-radius: 3px; }
 
 .library-sheet { width: min(540px, calc(100% - 32px)); }
@@ -784,7 +790,8 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 }
 
 @media print {
-  @page { margin: 18mm 17mm; }
+  /* Fallback only: printing from the app injects margins and page numbers from Publish settings. */
+  @page { margin: 25.4mm; }
   html, body, #app, .app-shell {
     width: auto;
     height: auto;
@@ -816,4 +823,11 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
   }
   body.printing .print-source.markdown-body > * { content-visibility: visible; }
   body.printing .print-source:last-child { break-after: auto; }
+  /* Keep everything inside the page margins: wrap code instead of clipping it behind a scrollbar. */
+  body.printing .print-source pre { white-space: pre-wrap; overflow: visible; overflow-wrap: anywhere; }
+  body.printing .print-source pre code { white-space: inherit; }
+  body.printing .print-source table { table-layout: auto; overflow-wrap: anywhere; }
+  body.printing .print-source :is(h1, h2, h3, h4) { break-after: avoid; break-inside: avoid; }
+  body.printing .print-source :is(img, tr, figure) { break-inside: avoid; }
+  body.printing .print-source :is(p, li, blockquote) { orphans: 3; widows: 3; }
 }

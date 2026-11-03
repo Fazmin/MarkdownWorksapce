@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, tick } from "svelte";
+  import { flushSync, onMount, tick } from "svelte";
   import { marked } from "marked";
   import hljs from "highlight.js/lib/common";
   import { invoke } from "@tauri-apps/api/core";
@@ -9,19 +9,19 @@
   import { open, save, confirm } from "@tauri-apps/plugin-dialog";
   import { themes, typefaces, type ThemeTokens } from "./lib/themes";
   import type { EditorHandle } from "./lib/editor";
+  import {
+    defaultExportOptions,
+    marginPresets,
+    normalizeExportOptions,
+    pageNumberFormats,
+    printPageCss,
+    type ExportOptions,
+    type PageMarginPreset,
+    type PageNumberPosition
+  } from "./lib/print";
 
   type StudioFile = { id: string; name: string; path?: string; content: string; savedContent: string };
   type SavedProject = { id: number; name: string; updated_at: string; file_count: number };
-  type ExportOptions = {
-    toc: boolean;
-    pageNumbers: boolean;
-    headerLeft: string;
-    headerCenter: string;
-    headerRight: string;
-    footerLeft: string;
-    footerCenter: string;
-    footerRight: string;
-  };
   type DocumentStats = {
     words: number;
     characters: number;
@@ -41,6 +41,14 @@
 
   const isTauri = "__TAURI_INTERNALS__" in window;
   const appWindow = isTauri ? getCurrentWindow() : null;
+  const windowLabel = appWindow?.label ?? "main";
+  const printStyleId = "print-page-style";
+  const pageNumberPositions: { id: PageNumberPosition; label: string }[] = [
+    { id: "left", label: "Left" },
+    { id: "center", label: "Center" },
+    { id: "right", label: "Right" }
+  ];
+  const marginOptions = Object.entries(marginPresets) as [PageMarginPreset, (typeof marginPresets)[PageMarginPreset]][];
   const renderCache = new Map<string, { source: string; html: string; bytes: number }>();
   const statsCache = new Map<string, { source: string; stats: DocumentStats }>();
   const maxRenderCacheBytes = 12 * 1024 * 1024;
@@ -94,18 +102,15 @@
   let projectId: number | null = null;
   let fileInput: HTMLInputElement;
   let folderInput: HTMLInputElement;
-  let exportOptions: ExportOptions = {
-    toc: true,
-    pageNumbers: true,
-    headerLeft: "",
-    headerCenter: "{title}",
-    headerRight: "",
-    footerLeft: "",
-    footerCenter: "",
-    footerRight: "{page}"
-  };
+  let exportOptions: ExportOptions = { ...defaultExportOptions };
+  let reportedIdle: boolean | null = null;
+  let reportedTitle = "";
 
   $: activeFile = files.find((file) => file.id === activeId) ?? files[0];
+  // Let the backend know when this window is on the welcome screen so files opened from the
+  // system can reuse it instead of spawning another window.
+  $: reportWindowIdle(files.length === 0 && !busy);
+  $: setWindowTitle(files.length ? `${projectName} — Markdown Studio` : "Markdown Studio");
   $: activeDirty = activeFile ? activeFile.content !== activeFile.savedContent : false;
   $: if (editMode && editorHandle && activeFile && activeFile.id !== editingFileId) {
     flushEdits();
@@ -222,12 +227,34 @@
     }
   }
 
+  function reportWindowIdle(idle: boolean) {
+    if (!isTauri || idle === reportedIdle) return;
+    reportedIdle = idle;
+    invoke("set_window_idle", { idle }).catch(() => {});
+  }
+
+  function setWindowTitle(title: string) {
+    if (!appWindow || title === reportedTitle) return;
+    reportedTitle = title;
+    appWindow.setTitle(title).catch(() => {});
+  }
+
+  async function openNewWindow() {
+    if (!isTauri) return notify("New windows are available in the desktop app");
+    try {
+      await invoke("open_new_window");
+    } catch (error) {
+      notify(`Unable to open a new window: ${String(error)}`);
+    }
+  }
+
   onMount(() => {
     let unlistenDrop: (() => void) | undefined;
     let unlistenOpen: (() => void) | undefined;
     let unlistenClose: (() => void) | undefined;
     const resize = () => updateMinimapLayout();
     window.addEventListener("resize", resize);
+    window.addEventListener("beforeprint", prepareFallbackPrint);
     document.addEventListener("selectionchange", scheduleSelectionMenu);
     if (isTauri) {
       getCurrentWebview()
@@ -246,7 +273,10 @@
         })
         .catch((error) => notify(`Drag and drop unavailable: ${String(error)}`));
       void (async () => {
-        unlistenOpen = await listen("open-files-requested", loadPendingOpenFiles);
+        // The event is broadcast to every window; only the window it names loads the files.
+        unlistenOpen = await listen<string>("open-files-requested", (event) => {
+          if (event.payload === windowLabel) loadPendingOpenFiles();
+        });
         await loadPendingOpenFiles();
       })();
       appWindow
@@ -270,6 +300,7 @@
       unlistenOpen?.();
       unlistenClose?.();
       window.removeEventListener("resize", resize);
+      window.removeEventListener("beforeprint", prepareFallbackPrint);
       document.removeEventListener("selectionchange", scheduleSelectionMenu);
       window.clearTimeout(selectionTimer);
       stopSpeaking();
@@ -763,7 +794,7 @@
       contentWidth = ["theme", "wide", "extra-wide"].includes(project.contentWidth)
         ? project.contentWidth
         : "theme";
-      exportOptions = project.exportOptions;
+      exportOptions = normalizeExportOptions(project.exportOptions);
       showSidePanels = true;
       showLibrary = false;
     } catch (error) {
@@ -816,25 +847,53 @@
           const html = isTauri
             ? await invoke<string>("render_markdown", { markdown: file.content })
             : String(await marked.parse(file.content));
-          return `<article class="markdown-body print-source"><div class="print-source-label">${String(index + 1).padStart(2, "0")} · ${escapeHtml(file.name)}</div>${html}</article>`;
+          return printSection(file, html, index);
         }));
         sections.push(...batch);
       }
       printHtml = sections.join("");
       showPublish = false;
       await tick();
-      const cleanup = () => {
-        document.body.classList.remove("printing");
-        printHtml = "";
-      };
-      window.addEventListener("afterprint", cleanup, { once: true });
-      document.body.classList.add("printing");
+      beginPrintLayout();
       window.setTimeout(() => window.print(), 50);
     } catch (error) {
       notify(`Unable to print: ${String(error)}`);
     } finally {
       busy = false;
     }
+  }
+
+  function printSection(file: StudioFile, html: string, index: number) {
+    return `<article class="markdown-body print-source"><div class="print-source-label">${String(index + 1).padStart(2, "0")} · ${escapeHtml(file.name)}</div>${html}</article>`;
+  }
+
+  /** Switches the page to the paginated print layout with the chosen margins and page numbers. */
+  function beginPrintLayout() {
+    document.getElementById(printStyleId)?.remove();
+    const style = document.createElement("style");
+    style.id = printStyleId;
+    style.textContent = printPageCss(exportOptions, projectName);
+    document.head.append(style);
+    document.body.classList.add("printing");
+    window.addEventListener("afterprint", endPrintLayout, { once: true });
+  }
+
+  function endPrintLayout() {
+    document.getElementById(printStyleId)?.remove();
+    document.body.classList.remove("printing");
+    printHtml = "";
+  }
+
+  /**
+   * Printing that bypasses the app (for example the WebView's own context-menu Print) would
+   * otherwise capture the clipped screen. Lay out the current document synchronously instead.
+   */
+  function prepareFallbackPrint() {
+    if (document.body.classList.contains("printing") || !activeFile || !renderedHtml) return;
+    const index = files.findIndex((file) => file.id === activeFile.id);
+    printHtml = printSection(activeFile, renderedHtml, Math.max(index, 0));
+    flushSync();
+    beginPrintLayout();
   }
 
   function notify(message: string) {
@@ -854,6 +913,7 @@
       event.preventDefault();
       if (editMode) saveActiveFile();
     }
+    if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === "n") { event.preventDefault(); openNewWindow(); }
     if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === "t") toggleThemeMode();
     if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === "e") { event.preventDefault(); showPublish = true; }
     if (event.key === "Escape") {
@@ -950,6 +1010,11 @@
         {/if}
         <button class="icon-button" title="Save project" aria-label="Save project" on:click={saveProject}>
           <svg viewBox="0 0 24 24"><path d="M5 4h12l2 2v14H5zM8 4v6h8V4M8 20v-6h8v6"/></svg>
+        </button>
+      {/if}
+      {#if isTauri}
+        <button class="icon-button" title="New window (Ctrl+Shift+N)" aria-label="Open a new window" on:click={openNewWindow}>
+          <svg viewBox="0 0 24 24"><rect x="3.5" y="6.5" width="13" height="13" rx="2"/><path d="M8 3.5h10.5a2 2 0 0 1 2 2V16M10 10v6M7 13h6"/></svg>
         </button>
       {/if}
       <button class="quiet-button" on:click={openLibrary}>Library</button>
@@ -1241,9 +1306,40 @@
             {/if}
             <label><input type="checkbox" bind:checked={exportOptions.toc} /><span>Table of contents</span></label>
             <label><input type="checkbox" bind:checked={exportOptions.pageNumbers} /><span>Page numbers</span></label>
+            {#if exportOptions.pageNumbers}
+              <div class="page-number-options">
+                <div class="segmented" role="group" aria-label="Page number position">
+                  {#each pageNumberPositions as position}
+                    <button
+                      class:active={exportOptions.pageNumberPosition === position.id}
+                      aria-pressed={exportOptions.pageNumberPosition === position.id}
+                      on:click={() => exportOptions.pageNumberPosition = position.id}
+                    >{position.label}</button>
+                  {/each}
+                </div>
+                <select bind:value={exportOptions.pageNumberFormat} aria-label="Page number format">
+                  {#each Object.entries(pageNumberFormats) as [id, format]}
+                    <option value={id}>{format.label}</option>
+                  {/each}
+                </select>
+              </div>
+            {/if}
+            <div class="field">
+              <span>Page margins</span>
+              <div class="segmented" role="group" aria-label="Page margins">
+                {#each marginOptions as [id, preset]}
+                  <button
+                    class:active={exportOptions.margins === id}
+                    aria-pressed={exportOptions.margins === id}
+                    title={`${preset.top} × ${preset.left} mm`}
+                    on:click={() => exportOptions.margins = id}
+                  >{preset.label}</button>
+                {/each}
+              </div>
+            </div>
             <div class="field"><span>Header · center</span><input bind:value={exportOptions.headerCenter} placeholder={"{title}"} /></div>
-            <div class="field"><span>Footer · center</span><input bind:value={exportOptions.footerCenter} placeholder={"{page}"} /></div>
-            <p>Tokens: <code>{"{title}"}</code> <code>{"{page}"}</code> <code>{"{date}"}</code></p>
+            <div class="field"><span>Footer · center</span><input bind:value={exportOptions.footerCenter} placeholder="Optional text" /></div>
+            <p>Tokens: <code>{"{title}"}</code> <code>{"{page}"}</code> <code>{"{pages}"}</code> <code>{"{date}"}</code></p>
           </div>
         </div>
       </div>
