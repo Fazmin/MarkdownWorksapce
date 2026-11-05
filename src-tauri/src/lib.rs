@@ -58,6 +58,11 @@ struct ExportOptions {
     page_number_format: String,
     #[serde(default = "default_margins")]
     margins: String,
+    /// Printed body text size in points, independent of the on-screen reader size.
+    #[serde(default = "default_text_size")]
+    text_size: f32,
+    #[serde(default)]
+    section_breaks: bool,
     #[serde(default)]
     header_left: String,
     #[serde(default)]
@@ -82,6 +87,39 @@ fn default_page_number_format() -> String {
 
 fn default_margins() -> String {
     "normal".to_string()
+}
+
+fn default_text_size() -> f32 {
+    11.0
+}
+
+fn printed_text_size(options: &ExportOptions) -> f32 {
+    options.text_size.clamp(8.0, 16.0)
+}
+
+/// Ink colours for paper output. Pages carry no background, so a dark theme's light text would
+/// vanish: it uses dark ink and a darkened accent instead.
+struct PrintPalette {
+    ink: String,
+    muted: String,
+    accent: String,
+}
+
+fn print_palette(theme: &ThemeTokens) -> PrintPalette {
+    if theme.mode != "dark" {
+        return PrintPalette {
+            ink: theme.ink.clone(),
+            muted: theme.muted.clone(),
+            accent: theme.accent.clone(),
+        };
+    }
+    let (red, green, blue) = rgb(&theme.accent);
+    let darken = |channel: f32| (channel * 0.58 * 255.0).round() as u8;
+    PrintPalette {
+        ink: "#161616".to_string(),
+        muted: "#666666".to_string(),
+        accent: format!("#{:02x}{:02x}{:02x}", darken(red), darken(green), darken(blue)),
+    }
 }
 
 /// Page margins in millimetres.
@@ -631,6 +669,73 @@ fn load_project_blocking(app: AppHandle, id: i64) -> Result<Project, String> {
     serde_json::from_str(&payload).map_err(|error| error.to_string())
 }
 
+/// Saves the window's print layout as a PDF using the WebView's own engine, so the result matches
+/// Print exactly. Returns `false` where that is unavailable and the built-in writer should be used.
+#[tauri::command]
+async fn print_window_to_pdf(window: WebviewWindow, path: String) -> Result<bool, String> {
+    #[cfg(windows)]
+    {
+        let bytes = webview_print_to_pdf(&window).await?;
+        fs::write(&path, bytes).map_err(|error| format!("Unable to save {path}: {error}"))?;
+        Ok(true)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (window, path);
+        Ok(false)
+    }
+}
+
+#[cfg(windows)]
+async fn webview_print_to_pdf(window: &WebviewWindow) -> Result<Vec<u8>, String> {
+    use base64::Engine;
+    use webview2_com::CallDevToolsProtocolMethodCompletedHandler;
+    use windows_core::HSTRING;
+
+    // A4 paper. Margins and page numbers come from the page's own `@page` rule.
+    const PARAMETERS: &str = r#"{"printBackground":true,"displayHeaderFooter":false,"paperWidth":8.27,"paperHeight":11.69,"generateTaggedPDF":true}"#;
+
+    let (sender, receiver) = std::sync::mpsc::channel::<Result<String, String>>();
+    let start_failure = sender.clone();
+    window
+        .with_webview(move |webview| {
+            let handler = CallDevToolsProtocolMethodCompletedHandler::create(Box::new(
+                move |status, json| {
+                    let _ = sender.send(status.map(|_| json).map_err(|error| error.to_string()));
+                    Ok(())
+                },
+            ));
+            let started = unsafe {
+                webview.controller().CoreWebView2().and_then(|core| {
+                    core.CallDevToolsProtocolMethod(
+                        &HSTRING::from("Page.printToPDF"),
+                        &HSTRING::from(PARAMETERS),
+                        &handler,
+                    )
+                })
+            };
+            if let Err(error) = started {
+                let _ = start_failure.send(Err(error.to_string()));
+            }
+        })
+        .map_err(|error| error.to_string())?;
+    let json = tauri::async_runtime::spawn_blocking(move || {
+        receiver.recv_timeout(std::time::Duration::from_secs(300))
+    })
+    .await
+    .map_err(|error| error.to_string())?
+    .map_err(|_| "Timed out while creating the PDF".to_string())??;
+    let response: serde_json::Value =
+        serde_json::from_str(&json).map_err(|error| error.to_string())?;
+    let data = response
+        .get("data")
+        .and_then(|value| value.as_str())
+        .ok_or("The PDF engine returned no data")?;
+    base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .map_err(|error| error.to_string())
+}
+
 #[tauri::command]
 async fn export_document(request: ExportRequest) -> Result<(), String> {
     tauri::async_runtime::spawn_blocking(move || export_document_blocking(request))
@@ -688,6 +793,7 @@ fn build_html(request: &ExportRequest) -> String {
         String::new()
     };
     let theme = &request.theme;
+    let palette = print_palette(theme);
     let typeface = match request.typeface.as_str() {
         "mono" => "ui-monospace, SFMono-Regular, Consolas, monospace",
         "sans" => "ui-sans-serif, system-ui, sans-serif",
@@ -704,9 +810,13 @@ a{{color:var(--accent)}} blockquote{{border-left:3px solid var(--accent);padding
 table{{border-collapse:collapse;width:100%}} td,th{{border-bottom:1px solid var(--rule);padding:.55em;text-align:left}}
 .source-file{{break-before:page;min-height:80vh}}.source-file:first-of-type{{break-before:auto}}.source-label{{font:10px ui-sans-serif;text-transform:uppercase;letter-spacing:.14em;color:var(--accent);margin-bottom:3em}}
 .toc{{break-after:page;min-height:80vh}}.toc ol{{padding:0;list-style:none}}.toc li{{border-bottom:1px solid var(--rule);padding:.7em 0}}.toc a{{display:block;text-decoration:none}}
-{page_css} @media print{{main{{padding:0;max-width:none}} pre{{white-space:pre-wrap;overflow-wrap:anywhere}} h1,h2,h3,h4{{break-after:avoid;break-inside:avoid}} img,tr{{break-inside:avoid}} p,li{{orphans:3;widows:3}} .source-file,.toc{{min-height:0}}}}
+{page_css} @media print{{:root{{--paper:transparent;--ink:{print_ink};--muted:{print_muted};--accent:{print_accent};--rule:#dddddd;--code:#f5f5f5}} html{{background:transparent}} body{{font-size:{print_size}pt}} main{{padding:0;max-width:none}} pre{{white-space:pre-wrap;overflow-wrap:anywhere}} h1,h2,h3,h4{{break-after:avoid;break-inside:avoid}} img,tr{{break-inside:avoid}} p,li{{orphans:3;widows:3}} .source-file,.toc{{min-height:0}}}}
 </style></head><body><main>{toc_page}{body}</main></body></html>"#,
         page_css = print_page_css(request),
+        print_size = printed_text_size(&request.export_options),
+        print_ink = palette.ink,
+        print_muted = palette.muted,
+        print_accent = palette.accent,
         paper = theme.paper,
         ink = theme.ink,
         muted = theme.muted,
@@ -735,7 +845,7 @@ fn print_page_css(request: &ExportRequest) -> String {
                 boxes.push_str(&format!(
                     "@{name}{{content:{};font:8.5pt ui-sans-serif,system-ui,sans-serif;color:{}}}",
                     css_content(template, request),
-                    request.theme.muted
+                    print_palette(&request.theme).muted
                 ));
             }
         }
@@ -803,10 +913,23 @@ fn markdown_text(markdown: &str) -> Vec<String> {
     for event in parser {
         match event {
             Event::Start(Tag::Heading { .. }) => current.push_str("# "),
-            Event::Start(Tag::Item) => current.push_str("• "),
+            Event::Start(Tag::Item) => {
+                // A nested list starts while its parent item's text is still pending.
+                if !current.trim().is_empty() {
+                    lines.extend(current.lines().map(str::to_owned));
+                }
+                current.clear();
+                current.push_str("• ");
+            }
             Event::Text(text) | Event::Code(text) => current.push_str(&text),
             Event::SoftBreak => current.push(' '),
             Event::HardBreak => current.push('\n'),
+            Event::End(TagEnd::TableCell) => current.push_str(" | "),
+            Event::End(TagEnd::TableHead) | Event::End(TagEnd::TableRow) => {
+                lines.push(current.trim_end_matches(" | ").to_owned());
+                current.clear();
+            }
+            Event::End(TagEnd::Table) => lines.push(String::new()),
             Event::End(TagEnd::Paragraph)
             | Event::End(TagEnd::Heading(_))
             | Event::End(TagEnd::Item)
@@ -856,10 +979,10 @@ const PDF_RUNNING_SIZE: f32 = 8.5;
 
 /// Advance widths of Helvetica for ASCII 32..=126, in 1/1000 em (Adobe core font metrics).
 const HELVETICA_WIDTHS: [u16; 95] = [
-    278, 278, 355, 556, 556, 889, 667, 222, 333, 333, 389, 584, 278, 333, 278, 278, 556, 556, 556,
+    278, 278, 355, 556, 556, 889, 667, 191, 333, 333, 389, 584, 278, 333, 278, 278, 556, 556, 556,
     556, 556, 556, 556, 556, 556, 556, 278, 278, 584, 584, 584, 556, 1015, 667, 667, 722, 722, 667,
     611, 778, 722, 278, 500, 667, 556, 833, 722, 778, 667, 778, 722, 667, 611, 722, 667, 944, 667,
-    667, 611, 278, 278, 278, 469, 556, 222, 556, 556, 500, 556, 556, 278, 556, 556, 222, 222, 500,
+    667, 611, 278, 278, 278, 469, 556, 333, 556, 556, 500, 556, 556, 278, 556, 556, 222, 222, 500,
     222, 833, 556, 556, 556, 556, 333, 500, 278, 556, 500, 722, 500, 500, 500, 334, 260, 334, 584,
 ];
 
@@ -887,6 +1010,10 @@ fn text_width(text: &str, size: f32, bold: bool) -> f32 {
         .map(|character| match character {
             ' '..='~' => HELVETICA_WIDTHS[character as usize - 32] as u32,
             '\t' => 4 * 278,
+            '•' => 350,
+            '—' | '…' | '™' | '‰' => 1000,
+            '‘' | '’' | '‚' => 222,
+            '“' | '”' | '„' => 333,
             _ => 556,
         })
         .sum();
@@ -974,7 +1101,7 @@ impl PdfPaginator {
 
 fn layout_pdf(request: &ExportRequest) -> Vec<Vec<PdfLine>> {
     let margins = page_margins(&request.export_options.margins);
-    let size = request.font_size.clamp(9.0, 20.0);
+    let size = printed_text_size(&request.export_options);
     let line_height = request.theme.line_height.clamp(1.0, 2.4);
     let paragraph_gap = size * request.theme.paragraph_gap.clamp(0.3, 2.0) * 0.8;
     let mut layout = PdfPaginator::new(margins, size, line_height);
@@ -1017,10 +1144,10 @@ fn write_pdf(path: &Path, request: &ExportRequest) -> Result<(), String> {
     let pages = layout_pdf(request);
     let margins = page_margins(&request.export_options.margins);
     let (header, footer) = running_slots(&request.export_options);
-    let (paper_r, paper_g, paper_b) = rgb(&request.theme.paper);
-    let (ink_r, ink_g, ink_b) = rgb(&request.theme.ink);
-    let (accent_r, accent_g, accent_b) = rgb(&request.theme.accent);
-    let (muted_r, muted_g, muted_b) = rgb(&request.theme.muted);
+    let palette = print_palette(&request.theme);
+    let (ink_r, ink_g, ink_b) = rgb(&palette.ink);
+    let (accent_r, accent_g, accent_b) = rgb(&palette.accent);
+    let (muted_r, muted_g, muted_b) = rgb(&palette.muted);
     let page_count = pages.len();
     let mut objects = Vec::<Vec<u8>>::new();
     objects.push(b"<< /Type /Catalog /Pages 2 0 R >>".to_vec());
@@ -1029,8 +1156,13 @@ fn write_pdf(path: &Path, request: &ExportRequest) -> Result<(), String> {
         .collect::<Vec<_>>()
         .join(" ");
     objects.push(format!("<< /Type /Pages /Kids [{kids}] /Count {page_count} >>").into_bytes());
-    objects.push(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec());
-    objects.push(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold >>".to_vec());
+    objects.push(
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>".to_vec(),
+    );
+    objects.push(
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>"
+            .to_vec(),
+    );
 
     // Running text sits in the middle of the top and bottom margins.
     let header_baseline =
@@ -1047,9 +1179,7 @@ fn write_pdf(path: &Path, request: &ExportRequest) -> Result<(), String> {
             )
             .into_bytes(),
         );
-        let mut stream = format!(
-            "{paper_r:.3} {paper_g:.3} {paper_b:.3} rg 0 0 {PDF_PAGE_WIDTH} {PDF_PAGE_HEIGHT} re f\n"
-        );
+        let mut stream = String::new();
         for line in lines {
             let (font, (red, green, blue)) = match line.style {
                 PdfStyle::Title => ("F2", (accent_r, accent_g, accent_b)),
@@ -1166,9 +1296,48 @@ fn pdf_escape(value: &str) -> String {
             '\\' => "\\\\".to_string(),
             '\t' => "    ".to_string(),
             value if value.is_ascii() => value.to_string(),
-            _ => "?".to_string(),
+            value => match win_ansi_byte(value) {
+                Some(byte) => format!("\\{byte:03o}"),
+                None => "?".to_string(),
+            },
         })
         .collect()
+}
+
+/// The WinAnsiEncoding byte for a non-ASCII character, covering Latin letters and typographic
+/// punctuation such as dashes, curly quotes, and bullets.
+fn win_ansi_byte(character: char) -> Option<u8> {
+    Some(match character {
+        '\u{A0}'..='\u{FF}' => character as u32 as u8,
+        '€' => 0x80,
+        '‚' => 0x82,
+        'ƒ' => 0x83,
+        '„' => 0x84,
+        '…' => 0x85,
+        '†' => 0x86,
+        '‡' => 0x87,
+        'ˆ' => 0x88,
+        '‰' => 0x89,
+        'Š' => 0x8A,
+        '‹' => 0x8B,
+        'Œ' => 0x8C,
+        'Ž' => 0x8E,
+        '‘' => 0x91,
+        '’' => 0x92,
+        '“' => 0x93,
+        '”' => 0x94,
+        '•' => 0x95,
+        '–' => 0x96,
+        '—' => 0x97,
+        '˜' => 0x98,
+        '™' => 0x99,
+        'š' => 0x9A,
+        '›' => 0x9B,
+        'œ' => 0x9C,
+        'ž' => 0x9E,
+        'Ÿ' => 0x9F,
+        _ => return None,
+    })
 }
 
 fn token_text(template: &str, request: &ExportRequest, page: usize, pages: usize) -> String {
@@ -1210,9 +1379,10 @@ fn write_docx(path: &Path, request: &ExportRequest) -> Result<(), String> {
             document_body.push_str(&word_paragraph(text, style));
         }
     }
-    let font_half_points = (request.font_size * 2.0).round() as u32;
-    let color = request.theme.ink.trim_start_matches('#');
-    let accent = request.theme.accent.trim_start_matches('#');
+    let font_half_points = (printed_text_size(&request.export_options) * 2.0).round() as u32;
+    let palette = print_palette(&request.theme);
+    let color = palette.ink.trim_start_matches('#');
+    let accent = palette.accent.trim_start_matches('#');
     let margins = page_margins(&request.export_options.margins);
     let twips = |millimetres: f32| (millimetres * 1440.0 / 25.4).round() as u32;
     let (top, right, bottom, left) = (
@@ -1266,7 +1436,8 @@ fn word_header_footer(
     request: &ExportRequest,
     content_width: u32,
 ) -> String {
-    let muted = request.theme.muted.trim_start_matches('#');
+    let palette = print_palette(&request.theme);
+    let muted = palette.muted.trim_start_matches('#');
     let run_properties = format!(r#"<w:rPr><w:color w:val="{muted}"/><w:sz w:val="17"/></w:rPr>"#);
     let column = content_width / 3;
     let cells = slots
@@ -1445,6 +1616,7 @@ pub fn run() {
             take_opened_files,
             set_window_idle,
             open_new_window,
+            print_window_to_pdf,
             render_markdown,
             read_markdown_paths,
             write_markdown_file,
@@ -1533,6 +1705,8 @@ mod tests {
             page_number_position: "center".into(),
             page_number_format: "number".into(),
             margins: "normal".into(),
+            text_size: 11.0,
+            section_breaks: false,
             header_left: String::new(),
             header_center: "{title}".into(),
             header_right: String::new(),
@@ -1594,6 +1768,64 @@ mod tests {
         assert_eq!(options.page_number_position, "center");
         assert_eq!(options.page_number_format, "number");
         assert_eq!(page_margins(&options.margins), page_margins("normal"));
+        assert_eq!(options.text_size, 11.0);
+    }
+
+    #[test]
+    fn printed_text_size_ignores_the_reader_size_and_controls_the_pdf() {
+        let mut options = sample_options();
+        options.text_size = 9.0;
+        let small = sample_request(options.clone(), vec![long_file()]);
+        options.text_size = 14.0;
+        let large = sample_request(options, vec![long_file()]);
+        assert_eq!(small.font_size, 18.0);
+        let body_size = |request: &ExportRequest| {
+            layout_pdf(request)
+                .iter()
+                .flatten()
+                .find(|line| line.style == PdfStyle::Body)
+                .unwrap()
+                .size
+        };
+        assert_eq!(body_size(&small), 9.0);
+        assert_eq!(body_size(&large), 14.0);
+        assert!(layout_pdf(&small).len() < layout_pdf(&large).len());
+    }
+
+    #[test]
+    fn dark_themes_export_dark_ink_with_no_page_background() {
+        let mut request = sample_request(sample_options(), vec![long_file()]);
+        request.theme.mode = "dark".into();
+        request.theme.ink = "#e9e8e1".into();
+        request.theme.accent = "#efb35d".into();
+        let palette = print_palette(&request.theme);
+        assert_eq!(palette.ink, "#161616");
+        assert_eq!(palette.accent, "#8b6836");
+
+        let path = std::env::temp_dir().join(format!("markdown-studio-dark-{}.pdf", std::process::id()));
+        write_pdf(&path, &request).unwrap();
+        let pdf = String::from_utf8_lossy(&fs::read(&path).unwrap()).into_owned();
+        let _ = fs::remove_file(path);
+        assert!(!pdf.contains(" re f"), "pages must not paint a background");
+        assert!(pdf.contains("0.086 0.086 0.086 rg"), "body text must use dark ink");
+
+        let html = build_html(&request);
+        assert!(html.contains("@media print{:root{--paper:transparent;--ink:#161616;"));
+    }
+
+    #[test]
+    fn markdown_text_keeps_table_cells_and_nested_items_apart() {
+        let lines = markdown_text("| Tool | Version |\n|---|---|\n| pnpm | 11.5.3 |\n\n- one\n  - two\n");
+        assert_eq!(lines[0], "Tool | Version");
+        assert_eq!(lines[1], "pnpm | 11.5.3");
+        assert!(lines.contains(&"• one".to_string()));
+        assert!(lines.contains(&"• two".to_string()));
+    }
+
+    #[test]
+    fn pdf_text_encodes_typographic_punctuation() {
+        assert_eq!(pdf_escape("1–5 — “ok” • é"), "1\\2265 \\227 \\223ok\\224 \\225 \\351");
+        assert_eq!(pdf_escape("→"), "?");
     }
 
     #[test]

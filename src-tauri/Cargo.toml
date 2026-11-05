@@ -21,3 +21,8 @@ pulldown-cmark = "0"
 rusqlite = { version = "0", features = ["bundled"] }
 chrono = "0"
 tauri-plugin-single-instance = "2.4.2"
+
+[target.'cfg(windows)'.dependencies]
+base64 = "0.22"
+webview2-com = "0.38"
+windows-core = "0.61"

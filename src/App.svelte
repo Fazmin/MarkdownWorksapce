@@ -10,11 +10,14 @@
   import { themes, typefaces, type ThemeTokens } from "./lib/themes";
   import type { EditorHandle } from "./lib/editor";
   import {
+    buildPrintDocument,
+    clampTextSize,
     defaultExportOptions,
     marginPresets,
     normalizeExportOptions,
     pageNumberFormats,
     printPageCss,
+    textSizeRange,
     type ExportOptions,
     type PageMarginPreset,
     type PageNumberPosition
@@ -208,14 +211,6 @@
 
   function formatStat(value: number) {
     return new Intl.NumberFormat(undefined, { notation: value >= 10_000 ? "compact" : "standard" }).format(value);
-  }
-
-  function escapeHtml(value: string) {
-    return value
-      .replaceAll("&", "&amp;")
-      .replaceAll("<", "&lt;")
-      .replaceAll(">", "&gt;")
-      .replaceAll('"', "&quot;");
   }
 
   async function loadPendingOpenFiles() {
@@ -823,13 +818,31 @@
     if (!path) return;
     busy = true;
     try {
-      await invoke("export_document", { request: { ...projectPayload(), format, outputPath: path } });
+      const rendered = format === "pdf" && await exportPdfFromPrintLayout(path);
+      if (!rendered) {
+        await invoke("export_document", { request: { ...projectPayload(), format, outputPath: path } });
+      }
       showPublish = false;
       notify(`${format.toUpperCase()} exported`);
     } catch (error) {
       notify(String(error));
     } finally {
       busy = false;
+    }
+  }
+
+  /**
+   * Lays the document out exactly as Print does and saves it through the WebView's PDF engine.
+   * Returns false where that engine is unavailable.
+   */
+  async function exportPdfFromPrintLayout(path: string) {
+    try {
+      await preparePrintLayout(files);
+      beginPrintLayout();
+      await loadPrintFonts();
+      return await invoke<boolean>("print_window_to_pdf", { path });
+    } finally {
+      endPrintLayout();
     }
   }
 
@@ -840,42 +853,48 @@
     if (!selectedFiles.length) return;
     busy = true;
     try {
-      const sections: string[] = [];
-      for (let start = 0; start < selectedFiles.length; start += 4) {
-        const batch = await Promise.all(selectedFiles.slice(start, start + 4).map(async (file, batchIndex) => {
-          const index = start + batchIndex;
-          const html = isTauri
-            ? await invoke<string>("render_markdown", { markdown: file.content })
-            : String(await marked.parse(file.content));
-          return printSection(file, html, index);
-        }));
-        sections.push(...batch);
-      }
-      printHtml = sections.join("");
+      await preparePrintLayout(selectedFiles);
       showPublish = false;
-      await tick();
       beginPrintLayout();
+      window.addEventListener("afterprint", endPrintLayout, { once: true });
+      await loadPrintFonts();
       window.setTimeout(() => window.print(), 50);
     } catch (error) {
+      endPrintLayout();
       notify(`Unable to print: ${String(error)}`);
     } finally {
       busy = false;
     }
   }
 
-  function printSection(file: StudioFile, html: string, index: number) {
-    return `<article class="markdown-body print-source"><div class="print-source-label">${String(index + 1).padStart(2, "0")} · ${escapeHtml(file.name)}</div>${html}</article>`;
+  async function preparePrintLayout(selectedFiles: StudioFile[]) {
+    const sources: { name: string; html: string }[] = [];
+    for (let start = 0; start < selectedFiles.length; start += 4) {
+      const batch = await Promise.all(selectedFiles.slice(start, start + 4).map(async (file) => ({
+        name: file.name,
+        html: isTauri
+          ? await invoke<string>("render_markdown", { markdown: file.content })
+          : String(await marked.parse(file.content))
+      })));
+      sources.push(...batch);
+    }
+    printHtml = buildPrintDocument(sources, exportOptions);
+    await tick();
   }
 
-  /** Switches the page to the paginated print layout with the chosen margins and page numbers. */
+  /** Fonts load on first use, and the print layout is hidden on screen until it is needed. */
+  async function loadPrintFonts() {
+    await Promise.allSettled(Array.from(document.fonts, (font) => font.load()));
+  }
+
+  /** Switches the page to the paginated print layout using the Publish settings. */
   function beginPrintLayout() {
     document.getElementById(printStyleId)?.remove();
     const style = document.createElement("style");
     style.id = printStyleId;
-    style.textContent = printPageCss(exportOptions, projectName);
+    style.textContent = printPageCss(exportOptions, projectName, activeTheme);
     document.head.append(style);
     document.body.classList.add("printing");
-    window.addEventListener("afterprint", endPrintLayout, { once: true });
   }
 
   function endPrintLayout() {
@@ -890,10 +909,10 @@
    */
   function prepareFallbackPrint() {
     if (document.body.classList.contains("printing") || !activeFile || !renderedHtml) return;
-    const index = files.findIndex((file) => file.id === activeFile.id);
-    printHtml = printSection(activeFile, renderedHtml, Math.max(index, 0));
+    printHtml = buildPrintDocument([{ name: activeFile.name, html: renderedHtml }], exportOptions);
     flushSync();
     beginPrintLayout();
+    window.addEventListener("afterprint", endPrintLayout, { once: true });
   }
 
   function notify(message: string) {
@@ -1295,7 +1314,7 @@
         <div class="publish-body">
           <div class="format-list">
             <button on:click={printDocument}><b>PRINT</b><span>Open the system print dialog</span><i>→</i></button>
-            <button on:click={() => exportDocument("pdf")}><b>PDF</b><span>Print-ready, themed pages</span><i>→</i></button>
+            <button on:click={() => exportDocument("pdf")}><b>PDF</b><span>Print-ready pages, no page background</span><i>→</i></button>
             <button on:click={() => exportDocument("docx")}><b>DOCX</b><span>Editable in Word and Pages</span><i>→</i></button>
             <button on:click={() => exportDocument("html")}><b>HTML</b><span>One self-contained file</span><i>→</i></button>
             <button on:click={() => exportDocument("md")}><b>MD</b><span>Combine every source into one Markdown file</span><i>→</i></button>
@@ -1324,6 +1343,22 @@
                 </select>
               </div>
             {/if}
+            <label><input type="checkbox" bind:checked={exportOptions.sectionBreaks} /><span>Start each section on a new page</span></label>
+            <div class="field text-size-field">
+              <span>Text size <b>{exportOptions.textSize} pt · {Math.round(exportOptions.textSize / textSizeRange.base * 100)}%</b></span>
+              <div class="text-size-control">
+                <button aria-label="Decrease printed text size" on:click={() => exportOptions.textSize = clampTextSize(exportOptions.textSize - textSizeRange.step)}>−</button>
+                <input
+                  type="range"
+                  aria-label="Printed text size"
+                  min={textSizeRange.min}
+                  max={textSizeRange.max}
+                  step={textSizeRange.step}
+                  bind:value={exportOptions.textSize}
+                />
+                <button aria-label="Increase printed text size" on:click={() => exportOptions.textSize = clampTextSize(exportOptions.textSize + textSizeRange.step)}>＋</button>
+              </div>
+            </div>
             <div class="field">
               <span>Page margins</span>
               <div class="segmented" role="group" aria-label="Page margins">

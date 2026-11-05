@@ -22,6 +22,7 @@ Everything stays on your device. There are no accounts, uploads, or external con
 - Export to PDF, DOCX, self-contained HTML, or combined Markdown
 - Print the current file or an entire collection
 - Add page numbers (left, center, or right; `1`, `Page 1`, or `Page 1 of 9`) and choose narrow, normal, or wide page margins for printing and every export
+- Set the printed text size (8–16 pt) separately from the on-screen reader size, and optionally start each section on a new page
 - Open several documents side by side, each in its own window
 - Work comfortably in light or dark mode
 
@@ -101,9 +102,10 @@ The Rust test suite includes a 250-file import and a generated 20,000-paragraph 
 - **Svelte** powers the reader, organizer, search, themes, and publishing controls.
 - **Rust** parses GitHub-Flavored Markdown, imports folders, and handles export work.
 - **SQLite** stores projects in the operating system's application-data directory.
-- The PDF exporter is a compact, pure-Rust implementation with no browser or external binary.
+- On Windows, PDF export uses the system WebView's print engine, so PDFs match Print exactly and support every language's characters. On macOS and Linux it uses a compact, pure-Rust writer with plainer formatting, limited to Latin text.
+- Printed and exported pages have no page background and use dark ink, including with dark themes.
 - DOCX export writes the Open XML package directly in Rust.
-- Shared theme tokens carry paper, ink, accent, sizing, and rhythm from the reader into exported documents.
+- Shared theme tokens carry typography, accent, and rhythm from the reader into exported documents.
 
 ---
 
